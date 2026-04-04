@@ -1,0 +1,17 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: unified-migration-accelerator
+  namespace: unified-migration-accelerator
+spec:
+  rules:
+    - host: unified-migration-accelerator.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: unified-migration-accelerator
+                port:
+                  number: 80
