@@ -1,0 +1,39 @@
+.page {
+  min-height: 100vh;
+  background: linear-gradient(180deg, #f7f4ff 0%, #ffffff 100%);
+  color: #161126;
+}
+.container {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 32px 24px 48px;
+}
+.hero {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  margin-bottom: 24px;
+}
+.title { margin: 0; font-size: 2.2rem; line-height: 1.1; }
+.subtitle { margin-top: 10px; color: #5a5374; max-width: 760px; }
+.badge { display: inline-flex; align-items: center; padding: 8px 12px; border-radius: 999px; background: #efe7ff; color: #4d2fa9; font-weight: 600; font-size: 0.9rem; }
+.metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-bottom: 24px; }
+.card { background: #ffffff; border: 1px solid #ece5fb; border-radius: 18px; padding: 18px; box-shadow: 0 12px 30px rgba(87, 59, 155, 0.08); }
+.metricLabel { color: #6a6384; font-size: 0.9rem; margin-bottom: 8px; }
+.metricValue { font-size: 2rem; font-weight: 700; }
+.grid { display: grid; grid-template-columns: 1.6fr 1fr; gap: 16px; }
+.tableWrap { overflow: auto; }
+.table { width: 100%; border-collapse: collapse; }
+.table th, .table td { text-align: left; padding: 12px 10px; border-bottom: 1px solid #eee7fb; vertical-align: top; }
+.table th { color: #6f6888; font-size: 0.9rem; font-weight: 600; }
+.projectName { font-weight: 700; color: #201738; text-decoration: none; }
+.projectName:hover { text-decoration: underline; }
+.muted { display: block; margin-top: 4px; color: #6c6682; font-size: 0.88rem; }
+.statusPill { display: inline-flex; padding: 6px 10px; border-radius: 999px; background: #f3edff; color: #5a35b0; font-size: 0.85rem; font-weight: 600; }
+.progressBar { width: 100%; height: 10px; border-radius: 999px; background: #efe8fb; overflow: hidden; margin-top: 8px; }
+.progressBar span { display: block; height: 100%; background: linear-gradient(90deg, #7e5bef 0%, #5d8eff 100%); }
+.list { display: flex; flex-direction: column; gap: 12px; }
+.listItem { border: 1px solid #ece5fb; border-radius: 14px; padding: 14px; background: #fcfbff; }
+.listTitle { font-weight: 700; margin-bottom: 6px; }
+@media (max-width: 980px) { .metrics, .grid { grid-template-columns: 1fr; } .hero { flex-direction: column; } }
