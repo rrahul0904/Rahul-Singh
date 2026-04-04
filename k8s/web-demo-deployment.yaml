@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unified-migration-web-demo
+  namespace: unified-migration-accelerator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: unified-migration-web-demo
+  template:
+    metadata:
+      labels:
+        app: unified-migration-web-demo
+    spec:
+      containers:
+        - name: unified-migration-web-demo
+          image: unified-migration-web-demo:demo
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
