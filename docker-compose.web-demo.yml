@@ -1,0 +1,11 @@
+version: '3.9'
+services:
+  unified-migration-web-demo:
+    build:
+      context: ./web-demo
+      dockerfile: Dockerfile
+    image: unified-migration-web-demo:demo
+    container_name: unified-migration-web-demo
+    ports:
+      - "8080:80"
+    restart: unless-stopped
