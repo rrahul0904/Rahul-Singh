@@ -1,0 +1,15 @@
+version: '3.9'
+services:
+  unified-migration-accelerator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: unified-migration-accelerator:demo
+    container_name: unified-migration-accelerator-demo
+    ports:
+      - "8000:8000"
+    environment:
+      APP_TITLE: Unified Data Migration Accelerator
+      APP_ENV: docker-demo
+      APP_VERSION: 0.1.0
+    restart: unless-stopped

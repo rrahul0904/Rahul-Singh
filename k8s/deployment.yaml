@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unified-migration-accelerator
+  namespace: unified-migration-accelerator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: unified-migration-accelerator
+  template:
+    metadata:
+      labels:
+        app: unified-migration-accelerator
+    spec:
+      containers:
+        - name: unified-migration-accelerator
+          image: unified-migration-accelerator:demo
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: APP_TITLE
+              value: Unified Data Migration Accelerator
+            - name: APP_ENV
+              value: kubernetes-demo
+            - name: APP_VERSION
+              value: 0.1.0
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
