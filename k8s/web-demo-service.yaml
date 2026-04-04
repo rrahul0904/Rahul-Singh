@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: unified-migration-web-demo
+  namespace: unified-migration-accelerator
+spec:
+  selector:
+    app: unified-migration-web-demo
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 80
+  type: ClusterIP
