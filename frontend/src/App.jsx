@@ -74,6 +74,7 @@ const api = {
   deleteConnection:  (id)       => apiFetch(`/connections/${id}`, { method:"DELETE" }),
   testConnection:    (id)       => apiFetch(`/connections/${id}/test`, { method:"POST" }),
   testCredentials:   (d)        => apiFetch("/connections/test-credentials", { method:"POST", body: JSON.stringify(d) }),
+  getRegistryStatus: ()         => apiFetch("/connections/registry-status"),
   // Jobs
   getJobs:           (p)        => apiFetch("/jobs" + (p ? "?"+new URLSearchParams(p) : "")),
   getJob:            (id)       => apiFetch(`/jobs/${id}`),
@@ -3272,41 +3273,16 @@ function SettingsPage() {
   const { data: history, refetch: refetchHistory } = useApi(() => api.getSettingsHistory().catch(()=>[]), []);
   const { data: health } = useApi(() => api.getHealth().catch(()=>null), []);
   const { data: connections } = useApi(() => api.getConnections().catch(()=>[]), []);
+  const { data: registry } = useApi(() => api.getRegistryStatus().catch(()=>[]), []);
   const [saved, setSaved] = useState(false);
   const [testing, setTesting] = useState("");
-
-  const ALL_CONNECTORS = [
-    { id:"bigquery",  name:"BigQuery",       icon:"🔷", status:"ready", source:true,  target:false },
-    { id:"redshift",  name:"Redshift",       icon:"🔴", status:"ready", source:true,  target:false },
-    { id:"snowflake", name:"Snowflake",      icon:"❄️", status:"ready", source:true,  target:true },
-    { id:"sqlserver", name:"SQL Server",     icon:"🟧", status:"ready", source:true,  target:false },
-    { id:"postgres",  name:"PostgreSQL",     icon:"🐘", status:"ready", source:true,  target:false },
-    { id:"mysql",     name:"MySQL",          icon:"🐬", status:"ready", source:true,  target:false },
-    { id:"oracle",    name:"Oracle",         icon:"🔶", status:"ready", source:true,  target:false },
-    { id:"teradata",  name:"Teradata",       icon:"⬛", status:"ready", source:true,  target:false },
-    { id:"synapse",   name:"Synapse",        icon:"🔷", status:"ready", source:true,  target:false },
-    { id:"salesforce",name:"Salesforce",     icon:"☁️", status:"ready", source:true,  target:false },
-    { id:"zendesk",   name:"Zendesk",        icon:"🎫", status:"ready", source:true,  target:false },
-    { id:"hubspot",   name:"HubSpot",        icon:"🧡", status:"ready", source:true,  target:false },
-    { id:"stripe",    name:"Stripe",         icon:"💳", status:"ready", source:true,  target:false },
-    { id:"jira",      name:"Jira",           icon:"🔵", status:"ready", source:true,  target:false },
-    { id:"s3",        name:"Amazon S3",      icon:"🪣", status:"ready", source:true,  target:true },
-    { id:"adls",      name:"ADLS Gen2",      icon:"🌊", status:"ready", source:true,  target:true },
-    { id:"gcs",       name:"GCS",            icon:"🟡", status:"ready", source:true,  target:true },
-    { id:"sftp",      name:"SFTP",           icon:"📂", status:"ready", source:true,  target:false },
-    { id:"flatfile",  name:"Flat Files",     icon:"📄", status:"ready", source:true,  target:false },
-    { id:"kafka",     name:"Kafka",          icon:"⚡", status:"ready", source:true,  target:false },
-    { id:"kinesis",   name:"Kinesis",        icon:"🌀", status:"ready", source:true,  target:false },
-    { id:"rest",      name:"REST/GraphQL",   icon:"🔌", status:"ready", source:true,  target:false },
-    { id:"netsuite",  name:"NetSuite",       icon:"🟦", status:"coming", source:true, target:false },
-    { id:"workday",   name:"Workday",        icon:"🟩", status:"coming", source:true, target:false },
-    { id:"ga4",       name:"Google Analytics",icon:"📊", status:"coming", source:true,target:false },
-  ];
-  const readyCount = ALL_CONNECTORS.filter(c=>c.status==="ready").length;
-  const configuredCounts = (connections||[]).reduce((acc,c)=>{
-    acc[c.type] = (acc[c.type] || 0) + 1;
-    return acc;
-  }, {});
+  const readyCount = (registry || []).filter(c=>c.status==="ready").length;
+  const registryIcons = {
+    bigquery:"🔷", redshift:"🔴", snowflake:"❄️", sqlserver:"🟧", postgres:"🐘", mysql:"🐬", oracle:"🔶",
+    teradata:"⬛", synapse:"🔷", salesforce:"☁️", zendesk:"🎫", hubspot:"🧡", stripe:"💳", jira:"🔵",
+    s3:"🪣", adls:"🌊", gcs:"🟡", sftp:"📂", flatfile:"📄", kafka:"⚡", kinesis:"🌀", rest:"🔌",
+    netsuite:"🟦", workday:"🟩", ga4:"📊"
+  };
 
   const [form, setForm] = useState(null);
   useEffect(() => { if (settings) setForm(JSON.parse(JSON.stringify(settings))); }, [settings]);
@@ -3441,20 +3417,19 @@ function SettingsPage() {
       <div className="card mb4" style={{ padding:20 }}>
         <div className="settings-title">Connector Registry — {readyCount} ready · {(connections||[]).length} configured</div>
         <div className="connector-matrix">
-          {ALL_CONNECTORS.map(c=>{
-            const configured = configuredCounts[c.id] || 0;
+          {(registry || []).map(c=>{
             return (
-            <div key={c.id} className="conn-matrix-card">
-              <div className="conn-matrix-icon">{c.icon}</div>
+            <div key={c.connector_key} className="conn-matrix-card">
+              <div className="conn-matrix-icon">{registryIcons[c.connector_key] || "🔗"}</div>
               <div>
-                <div className="conn-matrix-name">{c.name}</div>
+                <div className="conn-matrix-name">{c.display_name}</div>
                 <div style={{ fontSize:10, color:"var(--text3)", fontFamily:"var(--font-m)" }}>
-                  {c.id} · {c.source ? "Source" : "—"} / {c.target ? "Target" : "—"} · configured {configured}
+                  {c.connector_key} · source {c.source_count} · target {c.target_count} · configured {c.configured_count}
                 </div>
               </div>
               <div className="conn-matrix-status">
-                {configured > 0 && <span className="badge bp" style={{ fontSize:9, marginRight:5 }}>CONFIGURED</span>}
-                <span className={`badge ${c.status==="ready"?"bg":"bgr"}`} style={{ fontSize:9 }}>{c.status === "ready" ? "READY" : "SOON"}</span>
+                {c.has_configured_connection && <span className="badge bp" style={{ fontSize:9, marginRight:5 }}>CONFIGURED</span>}
+                <span className={`badge ${c.status==="ready"?"bg":"bgr"}`} style={{ fontSize:9 }}>{c.status === "ready" ? "READY" : "COMING SOON"}</span>
               </div>
             </div>
           )})}

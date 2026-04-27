@@ -5,6 +5,7 @@ Encrypted credentials at rest, auth, audit logging.
 
 import asyncio
 import logging
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -23,6 +24,34 @@ from models import Connection, ConnectionRole, ConnectionType, User
 router = APIRouter()
 logger = logging.getLogger("uma.routes.connections")
 _pool = ThreadPoolExecutor(max_workers=4)
+
+CONNECTOR_REGISTRY = [
+    {"key": "bigquery", "display_name": "BigQuery", "status": "ready", "source": True, "target": False},
+    {"key": "redshift", "display_name": "Redshift", "status": "ready", "source": True, "target": False},
+    {"key": "snowflake", "display_name": "Snowflake", "status": "ready", "source": True, "target": True},
+    {"key": "sqlserver", "display_name": "SQL Server", "status": "ready", "source": True, "target": False},
+    {"key": "postgres", "display_name": "PostgreSQL", "status": "ready", "source": True, "target": False},
+    {"key": "mysql", "display_name": "MySQL", "status": "ready", "source": True, "target": False},
+    {"key": "oracle", "display_name": "Oracle", "status": "ready", "source": True, "target": False},
+    {"key": "teradata", "display_name": "Teradata", "status": "ready", "source": True, "target": False},
+    {"key": "synapse", "display_name": "Synapse", "status": "ready", "source": True, "target": False},
+    {"key": "salesforce", "display_name": "Salesforce", "status": "ready", "source": True, "target": False},
+    {"key": "zendesk", "display_name": "Zendesk", "status": "ready", "source": True, "target": False},
+    {"key": "hubspot", "display_name": "HubSpot", "status": "ready", "source": True, "target": False},
+    {"key": "stripe", "display_name": "Stripe", "status": "ready", "source": True, "target": False},
+    {"key": "jira", "display_name": "Jira", "status": "ready", "source": True, "target": False},
+    {"key": "s3", "display_name": "Amazon S3", "status": "ready", "source": True, "target": True},
+    {"key": "adls", "display_name": "ADLS Gen2", "status": "ready", "source": True, "target": True},
+    {"key": "gcs", "display_name": "GCS", "status": "ready", "source": True, "target": True},
+    {"key": "sftp", "display_name": "SFTP", "status": "ready", "source": True, "target": False},
+    {"key": "flatfile", "display_name": "Flat Files", "status": "ready", "source": True, "target": False},
+    {"key": "kafka", "display_name": "Kafka", "status": "ready", "source": True, "target": False},
+    {"key": "kinesis", "display_name": "Kinesis", "status": "ready", "source": True, "target": False},
+    {"key": "rest", "display_name": "REST/GraphQL", "status": "ready", "source": True, "target": False},
+    {"key": "netsuite", "display_name": "NetSuite", "status": "coming_soon", "source": True, "target": False},
+    {"key": "workday", "display_name": "Workday", "status": "coming_soon", "source": True, "target": False},
+    {"key": "ga4", "display_name": "Google Analytics", "status": "coming_soon", "source": True, "target": False},
+]
 
 
 class ConnectionCreate(BaseModel):
@@ -108,6 +137,37 @@ async def list_connections(
 ):
     result = await db.execute(select(Connection).order_by(Connection.created_at.desc()))
     return [_safe_conn(c) for c in result.scalars()]
+
+
+@router.get("/registry-status")
+async def get_registry_status(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Connection))
+    counts: Dict[str, Dict[str, int]] = defaultdict(lambda: {"configured_count": 0, "source_count": 0, "target_count": 0})
+
+    for conn in result.scalars():
+        key = conn.type.value
+        role = getattr(conn.connection_role, "value", conn.connection_role or "both")
+        counts[key]["configured_count"] += 1
+        if role in ("source", "both"):
+            counts[key]["source_count"] += 1
+        if role in ("target", "both"):
+            counts[key]["target_count"] += 1
+
+    return [
+        {
+            "connector_key": item["key"],
+            "display_name": item["display_name"],
+            "status": item["status"],
+            "configured_count": counts[item["key"]]["configured_count"],
+            "source_count": counts[item["key"]]["source_count"],
+            "target_count": counts[item["key"]]["target_count"],
+            "has_configured_connection": counts[item["key"]]["configured_count"] > 0,
+        }
+        for item in CONNECTOR_REGISTRY
+    ]
 
 
 @router.get("/{connection_id}")
