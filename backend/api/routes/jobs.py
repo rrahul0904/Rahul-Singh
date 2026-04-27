@@ -161,14 +161,20 @@ async def create_job(body: JobCreate, db: AsyncSession = Depends(get_db)):
     except ValueError as e:
         raise HTTPException(400, str(e))
 
+    dst_cfg = dst.config or {}
+    sf_warehouse = (body.sf_warehouse or dst_cfg.get("warehouse") or "").strip()
+    sf_database = (body.sf_database or dst_cfg.get("database") or "").strip()
+    sf_schema = (body.sf_schema or dst_cfg.get("schema") or "").strip()
+    sf_role = (body.sf_role or dst_cfg.get("role") or "").strip()
+
     job = Job(
         name=body.name,
         source_connection_id=body.source_connection_id,
         dest_connection_id=body.dest_connection_id,
-        sf_warehouse=body.sf_warehouse,
-        sf_database=body.sf_database,
-        sf_schema=body.sf_schema,
-        sf_role=body.sf_role,
+        sf_warehouse=sf_warehouse,
+        sf_database=sf_database,
+        sf_schema=sf_schema,
+        sf_role=sf_role,
         destination_mode=dest_mode,
         load_strategy=load_strat,
         file_format=body.file_format,
