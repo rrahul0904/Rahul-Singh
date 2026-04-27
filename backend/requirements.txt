@@ -1,0 +1,98 @@
+# UMA Platform — Backend Dependencies
+
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+
+# Database
+sqlalchemy[asyncio]==2.0.35
+asyncpg==0.29.0
+alembic==1.13.3
+
+# Settings
+pydantic-settings==2.5.2
+pydantic==2.9.2
+
+# Redis / job queue
+redis==5.1.0
+arq==0.26.1
+croniter==3.0.3
+
+# HTTP client
+httpx==0.27.2
+
+# Snowflake
+snowflake-connector-python==3.12.3
+snowflake-sqlalchemy==1.6.1
+
+# BigQuery
+google-cloud-bigquery==3.25.0
+google-cloud-storage==2.18.2
+google-auth==2.35.0
+
+# AWS
+boto3==1.35.36
+botocore==1.35.36
+
+# Azure
+azure-storage-blob==12.23.0
+azure-identity==1.19.0
+
+# Salesforce
+simple-salesforce==1.12.6
+
+# PostgreSQL (source connector)
+psycopg2-binary==2.9.9
+
+# SQL Server (source connector)
+# pyodbc==5.1.0
+
+# Oracle (thin mode - no client required)
+oracledb==2.4.1
+
+# MySQL
+mysql-connector-python==9.0.0
+
+# Teradata
+teradatasql==20.0.0.15
+
+# Streaming
+kafka-python==2.0.2
+
+# SFTP
+paramiko==3.5.0
+
+# Data formats
+pyarrow==17.0.0
+pandas==2.2.3
+openpyxl==3.1.5
+fastavro==1.9.7
+
+# Crypto / secrets
+cryptography==43.0.3
+bcrypt==4.2.0
+pyjwt==2.9.0
+
+# Email validation (for Pydantic EmailStr)
+email-validator==2.2.0
+
+# Observability
+structlog==24.4.0
+sentry-sdk[fastapi]==2.17.0
+prometheus-client==0.21.0
+prometheus-fastapi-instrumentator==7.0.0
+
+# Migrations
+alembic==1.13.3
+
+# Additional source connectors
+# ibm-db==3.2.3                    # IBM DB2
+# hdbcli==2.22.25                  # SAP HANA
+google-cloud-pubsub==2.25.2      # GCP Pub/Sub
+google-analytics-data==0.18.13   # GA4 Data API
+azure-eventhub==5.12.1           # Azure Event Hubs
+
+# Dev / testing
+pytest==8.3.3
+pytest-asyncio==0.24.0
