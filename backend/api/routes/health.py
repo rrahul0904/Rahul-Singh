@@ -35,7 +35,6 @@ async def health():
         "environment": settings.ENVIRONMENT,
         "build_sha":   settings.BUILD_SHA,
         "build_time":  settings.BUILD_TIME,
-        "demo_mode":   settings.DEMO_MODE_ENABLED,
         "uptime_s":    int(time.time() - _start_time),
         "timestamp":   datetime.utcnow().isoformat(),
     }

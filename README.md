@@ -1,158 +1,82 @@
-# UMA Data Migration Accelerator
+# Unified Data Migration Accelerator
 
-Self-hosted migration control plane for moving source data into Snowflake, with connection management, job orchestration, validation, email verification, and OpenAI-backed copilot features.
+UMA is a self-hosted migration control plane for Snowflake-centered data migration. The current baseline focuses on real migration workflows, conversion tools, validation, replication planning, and admin controls without fake success states.
 
-## Prerequisites
+## Current Status
 
-- Docker Desktop with Compose support
-- `curl`
-- A free local port for:
-  - `5173` frontend
-  - `8000` API
-  - `5432` PostgreSQL
-  - `6379` Redis
-- Optional for full product testing:
-  - Snowflake account and credentials
-  - SMTP credentials for real verification emails
-  - OpenAI API key
+The primary frontend is the `5174` frontend. The `5175` focused UI experiment is stopped and deprecated unless it is explicitly revived later.
 
-## Repository Setup
+Priority modules:
 
-1. Copy the example environment file:
+- Command Center
+- Migration Run
+- SQL Converter
+- dbt Converter
+- Data Replication
+- Validation Center
+- Admin
 
-```bash
-cp .env.example .env
-```
+Product rules for this baseline:
 
-2. Generate a strong `SECRET_KEY`:
+- DBT Package Builder stays inside dbt Converter.
+- UMA Brain Review is global, not dbt-only.
+- Schema Drift means source-to-target schema comparison.
+- No fake/static/demo success states.
+- No silent buttons.
 
-```bash
-python3 -c "import secrets; print(secrets.token_urlsafe(48))"
-```
-
-3. Set the generated value in `.env`:
-
-```env
-SECRET_KEY=replace-with-generated-value
-```
-
-4. If you want a dedicated application encryption key, generate one:
+## Frontend
 
 ```bash
-python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+cd frontend
+npm install
+npm run dev -- --host 0.0.0.0 --port 5174
 ```
 
-5. Add it to `.env`:
+Open `http://localhost:5174`.
 
-```env
-UMA_ENCRYPTION_KEY=replace-with-generated-value
+## Backend
+
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
+
+API health check: `http://localhost:8000/api/health`
 
 ## Docker Compose
 
-Start the full stack:
-
 ```bash
-docker compose build
-docker compose up -d
+cp .env.example .env
+docker compose up --build
 ```
 
-Open:
+Frontend: `http://localhost:5174`
 
-- Frontend: [http://localhost:5173](http://localhost:5173)
-- API health: [http://localhost:8000/api/health](http://localhost:8000/api/health)
+Backend: `http://localhost:8000`
 
-Stop everything:
+## Required Environment Variables
 
-```bash
-docker compose down
-```
+Copy `.env.example` to `.env` and replace placeholders with environment-specific values. Do not commit `.env` or credential-bearing files.
 
-Reset local data:
+Required for local startup:
 
-```bash
-docker compose down -v
-```
+- `SECRET_KEY`
+- `UMA_ENCRYPTION_KEY`
+- `DATABASE_URL`
+- `REDIS_URL`
+- `CORS_ORIGINS`
 
-## SMTP Configuration
+Required for real Snowflake execution:
 
-SMTP is optional for local development. If SMTP is not configured:
+- `SNOWFLAKE_ACCOUNT`
+- `SNOWFLAKE_USER`
+- `SNOWFLAKE_PASSWORD`
+- `SNOWFLAKE_WAREHOUSE`
+- `SNOWFLAKE_DATABASE`
+- `SNOWFLAKE_SCHEMA`
+- `SNOWFLAKE_ROLE`
 
-- registration still works
-- verification tokens are still created
-- the API returns a `dev_verification_url`
-- the backend logs the verification URL
-
-To enable real verification emails, set:
-
-```env
-SMTP_HOST=smtp.example.com
-SMTP_PORT=587
-SMTP_USER=your_smtp_user
-SMTP_PASSWORD=your_smtp_password
-SMTP_FROM_EMAIL=noreply@example.com
-SMTP_FROM_NAME=UMA Platform
-SMTP_USE_TLS=true
-REQUIRE_EMAIL_VERIFICATION=true
-```
-
-## Snowflake Configuration
-
-Global Snowflake defaults can be provided through `.env`:
-
-```env
-SNOWFLAKE_ACCOUNT=org-account
-SNOWFLAKE_USER=your_snowflake_user
-SNOWFLAKE_PASSWORD=your_snowflake_password
-SNOWFLAKE_WAREHOUSE=COMPUTE_WH
-SNOWFLAKE_DATABASE=ANALYTICS_DB
-SNOWFLAKE_SCHEMA=RAW
-SNOWFLAKE_ROLE=SYSADMIN
-```
-
-For TLS troubleshooting:
-
-```env
-SNOWFLAKE_CA_BUNDLE=/path/to/ca-bundle.crt
-SNOWFLAKE_INSECURE_MODE=false
-```
-
-`SNOWFLAKE_INSECURE_MODE=true` should be used only for local development when you need to bypass TLS validation temporarily.
-
-## Local Smoke Checks
-
-Basic API health:
-
-```bash
-curl http://localhost:8000/api/health
-```
-
-Backend smoke test:
-
-```bash
-docker compose run --rm api pytest tests/test_smoke.py
-```
-
-Existing helper scripts:
-
-```bash
-./quick-test.sh
-./golden-path-smoke.sh
-```
-
-## Product Flow
-
-1. Start the stack with `docker compose up -d`
-2. Open the frontend
-3. Register the first admin account
-4. Verify email through SMTP or `dev_verification_url`
-5. Create source and target connections
-6. Create a migration job
-7. Execute the job
-8. Review logs, validation, and run status
-
-## Notes
-
-- Do not commit `.env`, secrets, logs, staging files, or build output.
-- OpenAI-backed features require a valid `OPENAI_API_KEY`.
-- Snowflake connectivity depends on your account, role, warehouse, and TLS environment.
+Optional integrations include `OPENAI_API_KEY`, SMTP settings, AWS/S3 settings, Azure storage settings, Slack webhook settings, Ollama, and self-hosted OpenAI-compatible model endpoints.

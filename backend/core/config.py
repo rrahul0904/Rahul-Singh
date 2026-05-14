@@ -7,12 +7,28 @@ Fails fast on startup if required production values are missing.
 import logging
 import os
 import secrets
+import base64
 from typing import List, Optional
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger("uma.config")
+
+PLACEHOLDER_SECRET_KEYS = {
+    "",
+    "change-me-in-production",
+    "your-random-64-char-secret-here-change-me",
+    "replace-with-a-random-64-char-secret",
+    "test-secret-key-for-pytest-only-do-not-use-in-prod",
+}
+
+PLACEHOLDER_ENCRYPTION_KEYS = {
+    "",
+    "replace-with-generated-value",
+    "replace-with-a-fernet-key",
+    "replace-with-a-fernet-key-generated-for-this-install",
+}
 
 
 class Settings(BaseSettings):
@@ -72,6 +88,7 @@ class Settings(BaseSettings):
 
     # ── AI ───────────────────────────────────────────────────
     ANTHROPIC_API_KEY:        str = ""
+    ANTHROPIC_MODEL:          str = "claude-3-5-sonnet-latest"
     OPENAI_API_KEY:           str = ""
     OPENAI_MODEL:             str = "gpt-4o"
     AZURE_OPENAI_API_KEY:     str = ""
@@ -83,9 +100,40 @@ class Settings(BaseSettings):
     INTERNAL_LLM_API_KEY:     str = ""
     AIRGAPPED_MODE:           bool = False
     CORTEX_SEMANTIC_MODEL:    str = ""
-
-    # ── Demo / local bootstrap ──────────────────────────────
-    DEMO_MODE_ENABLED:       bool = False
+    COPILOT_PROVIDER:         str = "auto"
+    HERMES_AGENT_URL:         str = ""
+    HERMES_AGENT_TOKEN:       str = ""
+    CORTEX_ENABLED:           bool = True
+    CORTEX_LLM_MODEL:         str = "snowflake-arctic"
+    CORTEX_SEARCH_SERVICE:    str = ""
+    CORTEX_DOCUMENT_SEARCH_SERVICE: str = ""
+    AI_PROVIDER:              str = "auto"
+    AI_BASE_URL:              str = ""
+    AI_API_KEY:               str = ""
+    AI_CHAT_MODEL:            str = ""
+    AI_TEMPERATURE:           float = 0.1
+    AI_MAX_TOKENS:            int = 8192
+    AI_TIMEOUT_SECONDS:       int = 60
+    AI_STRUCTURED_OUTPUT_SUPPORTED: bool = True
+    AI_REDACT_EMAILS:         bool = False
+    AI_REDACT_HOSTNAMES:      bool = False
+    OLLAMA_ENABLED:           bool = False
+    OLLAMA_BASE_URL:          str = "http://localhost:11434"
+    OLLAMA_CHAT_MODEL:        str = "llama3.1"
+    OLLAMA_EMBEDDING_MODEL:   str = "nomic-embed-text"
+    OLLAMA_TIMEOUT_SECONDS:   int = 30
+    RAG_ENABLED:              bool = True
+    RAG_VECTOR_STORE:         str = "keyword"
+    RAG_INDEX_PATH:           str = "data/rag_index"
+    RAG_CHUNK_SIZE:           int = 1200
+    RAG_CHUNK_OVERLAP:        int = 150
+    RAG_MAX_RESULTS:          int = 8
+    RAG_TOP_K:                int = 8
+    RAG_MAX_CONTEXT_TOKENS:   int = 12000
+    RAG_EMBEDDING_PROVIDER:   str = "offline_keyword"
+    RAG_EMBEDDING_MODEL:      str = "offline_keyword"
+    RAG_EMBEDDING_DIM:        int = 256
+    RAG_EMBEDDING_BATCH_SIZE: int = 16
 
     # ── Alerting ─────────────────────────────────────────────
     SLACK_WEBHOOK_URL:   str = ""
@@ -144,18 +192,24 @@ class Settings(BaseSettings):
         if not self.SECRET_KEY or len(self.SECRET_KEY) < 32:
             errors.append("SECRET_KEY must be set and ≥32 chars in production")
 
-        if self.SECRET_KEY in (
-            "change-me-in-production",
-            "your-random-64-char-secret-here-change-me",
-            "",
-        ):
+        if self.SECRET_KEY in PLACEHOLDER_SECRET_KEYS:
             errors.append("SECRET_KEY must not be a default/placeholder value")
 
-        if not self.UMA_ENCRYPTION_KEY:
+        if self.UMA_ENCRYPTION_KEY in PLACEHOLDER_ENCRYPTION_KEYS:
             errors.append(
                 "UMA_ENCRYPTION_KEY is required in production. Generate with:\n"
                 "  python3 -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
             )
+        else:
+            try:
+                decoded = base64.urlsafe_b64decode(self.UMA_ENCRYPTION_KEY.encode())
+                if len(decoded) != 32:
+                    raise ValueError("invalid Fernet key length")
+            except Exception:
+                errors.append("UMA_ENCRYPTION_KEY must be a valid Fernet key in production")
+
+        if self.DATABASE_URL == "postgresql+asyncpg://uma:uma@postgres:5432/uma":
+            errors.append("DATABASE_URL must be explicitly configured for production")
 
         if "*" in self.CORS_ORIGINS:
             errors.append("CORS_ORIGINS must not contain '*' in production")

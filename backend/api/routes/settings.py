@@ -39,10 +39,24 @@ DEFAULTS = {
         "slack_channel": "#uma-alerts",
     },
     "ai": {
-        "provider": "openai",
-        "model": "gpt-4o",
-        "fallback_model": "gpt-4o-mini",
+        "provider": "offline_deterministic",
+        "base_url": "",
+        "model": "",
+        "fallback_model": "",
+        "max_tokens": 8192,
+        "temperature": 0.1,
+        "structured_output_supported": True,
         "budget_usd_limit": 25,
+        "advisory_only": True,
+    },
+    "rag": {
+        "enabled": True,
+        "embedding_provider": "offline_keyword",
+        "embedding_model": "offline_keyword",
+        "vector_store": "keyword",
+        "top_k": 8,
+        "indexed_artifact_count": 0,
+        "last_indexed_time": "",
     },
     "telemetry": {
         "enabled": False,
@@ -56,6 +70,7 @@ class SettingsPayload(BaseModel):
     snowflake_defaults: Dict[str, Any]
     alerts: Dict[str, Any]
     ai: Dict[str, Any]
+    rag: Dict[str, Any] = {}
     telemetry: Dict[str, Any]
 
 async def _ensure_defaults(db: AsyncSession):
@@ -75,13 +90,6 @@ async def get_settings(
     for key in DEFAULTS.keys():
         row = await db.get(PlatformSetting, key)
         out[key] = row.value if row else DEFAULTS[key]
-    ai = out.get("ai") or {}
-    if str(ai.get("provider", "")).lower() != "openai":
-        ai["provider"] = "openai"
-    model = str(ai.get("model", "")).strip().lower()
-    if not model or not model.startswith("gpt-"):
-        ai["model"] = "gpt-4o"
-    out["ai"] = ai
     return out
 
 @router.put("")
@@ -94,13 +102,7 @@ async def save_settings(
     await _ensure_defaults(db)
     incoming = body.model_dump()
     incoming.setdefault("ai", {})
-    incoming["ai"]["provider"] = "openai"
-    if "model" in incoming["ai"] and isinstance(incoming["ai"]["model"], str):
-        if not incoming["ai"]["model"].lower().startswith("gpt-"):
-            incoming["ai"]["model"] = "gpt-4o"
-    if "fallback_model" in incoming["ai"] and isinstance(incoming["ai"]["fallback_model"], str):
-        if not incoming["ai"]["fallback_model"].lower().startswith("gpt-"):
-            incoming["ai"]["fallback_model"] = "gpt-4o-mini"
+    incoming["ai"]["advisory_only"] = True
     for key, new_val in incoming.items():
         row = await db.get(PlatformSetting, key)
         old_val = row.value if row else None
@@ -142,7 +144,7 @@ async def test_email(
     ctx = {k:v for k,v in extract_request_context(request).items() if k in ("ip","user_agent","request_id")}
     await audit_record(action=AuditAction.SETTINGS_TESTED, user_id=user.id, user_email=user.email,
                        resource="settings:email", details={"provider": "smtp"}, **ctx)
-    return {"success": True, "message": "Email settings test queued (demo implementation)."}
+    return {"success": True, "message": "Email settings test endpoint reached. Configure SMTP to send real notifications."}
 
 @router.post("/test-slack")
 async def test_slack(
@@ -152,4 +154,4 @@ async def test_slack(
     ctx = {k:v for k,v in extract_request_context(request).items() if k in ("ip","user_agent","request_id")}
     await audit_record(action=AuditAction.SETTINGS_TESTED, user_id=user.id, user_email=user.email,
                        resource="settings:slack", details={"channel": "#uma-alerts"}, **ctx)
-    return {"success": True, "message": "Slack settings test queued (demo implementation)."}
+    return {"success": True, "message": "Slack settings test endpoint reached. Configure a webhook to send real notifications."}

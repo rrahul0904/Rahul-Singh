@@ -8,8 +8,9 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, EmailStr, field_validator
-from sqlalchemy import select, func
+from pydantic import BaseModel, field_validator
+from email_validator import EmailNotValidError, validate_email
+from sqlalchemy import delete, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import get_db
@@ -20,7 +21,12 @@ from core.auth import (
 from core.audit import record as audit_record, AuditAction, extract_request_context
 from core.lockout import get_lockout
 from core.config import settings
-from core.email import generate_email_token, hash_email_token, send_verification_email
+from core.email import (
+    generate_email_token,
+    hash_email_token,
+    send_verification_email,
+    verification_smtp_missing_fields,
+)
 from models import User, UserRole, ApiToken, EmailVerificationToken
 
 router = APIRouter()
@@ -29,6 +35,24 @@ router = APIRouter()
 # ─── Password policy ──────────────────────────────────────────
 
 PASSWORD_MIN_LENGTH = 12
+
+
+def normalize_email_address(raw: str) -> str:
+    value = (raw or "").strip().lower()
+    if not value:
+        raise ValueError("Email address is required")
+
+    # Allow local-development bootstrap identities like `admin@uma.local`
+    # outside production while still keeping strict validation elsewhere.
+    if settings.ENVIRONMENT != "production":
+        if re.fullmatch(r"[^@\s]+@(?:localhost|[a-z0-9-]+(?:\.[a-z0-9-]+)*\.local)", value):
+            return value
+
+    try:
+        normalized = validate_email(value, check_deliverability=False)
+    except EmailNotValidError as exc:
+        raise ValueError(str(exc)) from exc
+    return normalized.email.lower()
 
 
 def validate_password_strength(password: str) -> None:
@@ -46,13 +70,28 @@ def validate_password_strength(password: str) -> None:
         raise HTTPException(400, "Password must contain a special character")
 
 
+async def _admin_count(db: AsyncSession) -> int:
+    result = await db.execute(select(func.count(User.id)).where(User.role == UserRole.admin))
+    return int(result.scalar() or 0)
+
+
+async def _first_user_id(db: AsyncSession) -> Optional[str]:
+    result = await db.execute(select(User.id).order_by(User.created_at.asc(), User.id.asc()).limit(1))
+    return result.scalar_one_or_none()
+
+
 # ─── Schemas ──────────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
-    email:    EmailStr
+    email:    str
     name:     str
     password: str
     role:     Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v):
+        return normalize_email_address(v)
 
     @field_validator("name")
     @classmethod
@@ -64,8 +103,13 @@ class RegisterRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    email:    EmailStr
+    email:    str
     password: str
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v):
+        return normalize_email_address(v)
 
 
 class VerifyEmailRequest(BaseModel):
@@ -73,12 +117,21 @@ class VerifyEmailRequest(BaseModel):
 
 
 class ResendVerificationRequest(BaseModel):
-    email: EmailStr
+    email: str
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v):
+        return normalize_email_address(v)
 
 
 class PasswordChangeRequest(BaseModel):
     current_password: str
     new_password:     str
+
+
+class AdminPasswordResetRequest(BaseModel):
+    new_password: str
 
 
 class TokenResponse(BaseModel):
@@ -91,6 +144,12 @@ class TokenResponse(BaseModel):
     email_verification_reason: Optional[str] = None
     email_verification_expires_at: Optional[datetime] = None
     dev_verification_url: Optional[str] = None
+
+
+class BootstrapStatusResponse(BaseModel):
+    bootstrap_available: bool
+    user_count: int
+    admin_count: int
 
 
 class UserResponse(BaseModel):
@@ -160,37 +219,47 @@ async def _create_and_send_verification(user: User, db: AsyncSession) -> dict:
 
 # ─── Routes ───────────────────────────────────────────────────
 
+@router.get("/bootstrap-status", response_model=BootstrapStatusResponse)
+async def bootstrap_status(db: AsyncSession = Depends(get_db)):
+    """Expose whether the unauthenticated first-admin bootstrap path is open."""
+    count_r = await db.execute(select(func.count(User.id)))
+    user_count = int(count_r.scalar() or 0)
+    admin_count = await _admin_count(db)
+    return BootstrapStatusResponse(
+        bootstrap_available=user_count == 0,
+        user_count=user_count,
+        admin_count=admin_count,
+    )
+
+
 @router.post("/register", response_model=TokenResponse)
 async def register(
     body: RegisterRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Bootstrap admin: first registration only. Disabled afterward."""
-    count_r = await db.execute(select(func.count(User.id)))
-    user_count = count_r.scalar()
-
-    if user_count > 0:
-        await audit_record(
-            action=AuditAction.USER_CREATED, status="denied",
-            details={"email": body.email, "reason": "registration_disabled"},
-            **{k: v for k, v in extract_request_context(request).items()
-               if k in ("ip", "user_agent", "request_id")},
-        )
-        raise HTTPException(
-            status_code=403,
-            detail="Registration disabled. Ask an admin to create your account."
-        )
+    """Public self-registration. Admin role is assigned separately after verification."""
+    existing = await db.execute(select(User).where(User.email == body.email.lower()))
+    if existing.scalar_one_or_none():
+        raise HTTPException(400, "Email already registered")
 
     validate_password_strength(body.password)
+
+    missing_smtp_fields = verification_smtp_missing_fields() if settings.REQUIRE_EMAIL_VERIFICATION else []
+    if missing_smtp_fields:
+        raise HTTPException(
+            status_code=503,
+            detail="Email delivery is not configured for this environment. Connect a mail provider, then create your account again.",
+        )
 
     user = User(
         email=body.email.lower(),
         name=body.name,
         password_hash=hash_password(body.password),
-        role=UserRole.admin,
+        role=UserRole.viewer,
         is_active=True,
-        email_verified=False,
+        email_verified=not settings.REQUIRE_EMAIL_VERIFICATION,
+        email_verified_at=datetime.utcnow() if not settings.REQUIRE_EMAIL_VERIFICATION else None,
     )
     db.add(user)
     await db.commit()
@@ -200,12 +269,22 @@ async def register(
         action=AuditAction.USER_CREATED, status="success",
         user_id=user.id, user_email=user.email,
         resource=f"user:{user.id}",
-        details={"role": "admin", "bootstrap": True},
+        details={"role": UserRole.viewer.value, "self_registration": True},
         **{k: v for k, v in extract_request_context(request).items()
            if k in ("ip", "user_agent", "request_id")},
     )
 
-    email_info = await _create_and_send_verification(user, db)
+    email_info = {}
+    if settings.REQUIRE_EMAIL_VERIFICATION:
+        email_info = await _create_and_send_verification(user, db)
+        if not email_info.get("email_verification_sent"):
+            await db.execute(delete(EmailVerificationToken).where(EmailVerificationToken.user_id == user.id))
+            await db.delete(user)
+            await db.commit()
+            raise HTTPException(
+                status_code=502,
+                detail="We could not send the verification email. Check the mail provider settings and try again.",
+            )
     token = create_jwt(user.id, user.role.value, user.email)
     return TokenResponse(access_token=token, user=_user_dict(user), **email_info)
 
@@ -318,7 +397,12 @@ async def _verify_email_token(token: str, db: AsyncSession):
     user.email_verified_at = datetime.utcnow()
     record.consumed_at = datetime.utcnow()
     await db.commit()
-    return {"verified": True, "email": user.email, "message": "Email verified successfully"}
+    return {
+        "verified": True,
+        "email": user.email,
+        "role": user.role.value,
+        "message": "Email verified successfully. Sign in, then open Users to finish administrator setup if no admin exists.",
+    }
 
 
 @router.post("/resend-verification")
@@ -443,13 +527,17 @@ async def revoke_token(
     )
 
 
-# ─── User administration (admin only) ─────────────────────────
+# ─── User administration ──────────────────────────────────────
 
 @router.get("/users", response_model=List[UserResponse])
 async def list_users(
-    _: User = Depends(require_admin),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    if current_user.role != UserRole.admin:
+        if await _admin_count(db) == 0:
+            return [UserResponse(**_user_dict(current_user))]
+        raise HTTPException(403, "User management requires admin role")
     r = await db.execute(select(User).order_by(User.created_at.desc()))
     return [UserResponse(**_user_dict(u)) for u in r.scalars()]
 
@@ -495,12 +583,26 @@ async def update_user(
     user_id: str,
     body: UpdateUserRequest,
     request: Request,
-    admin: User = Depends(require_admin),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     user = await db.get(User, user_id)
     if not user:
         raise HTTPException(404, "User not found")
+
+    admin_count = await _admin_count(db)
+    bootstrap_self_promotion = (
+        current_user.role != UserRole.admin
+        and admin_count == 0
+        and str(current_user.id) == str(user.id) == str(user_id)
+        and body.role == UserRole.admin.value
+        and body.name is None
+        and body.is_active is None
+        and getattr(current_user, "email_verified", False)
+        and str(await _first_user_id(db)) == str(current_user.id)
+    )
+    if current_user.role != UserRole.admin and not bootstrap_self_promotion:
+        raise HTTPException(403, "User management requires admin role")
 
     changes = {}
     if body.name is not None:
@@ -523,19 +625,57 @@ async def update_user(
     if "role" in changes:
         await audit_record(
             action=AuditAction.ROLE_CHANGED, status="success",
-            user_id=admin.id, user_email=admin.email,
+            user_id=current_user.id, user_email=current_user.email,
             resource=f"user:{user.id}",
-            details={"target_user": user.email, "old_role": old_role, "new_role": user.role.value},
+            details={
+                "target_user": user.email,
+                "old_role": old_role,
+                "new_role": user.role.value,
+                "bootstrap_self_promotion": bootstrap_self_promotion,
+            },
             **ctx,
         )
     else:
         await audit_record(
             action=AuditAction.USER_UPDATED, status="success",
-            user_id=admin.id, user_email=admin.email,
+            user_id=current_user.id, user_email=current_user.email,
             resource=f"user:{user.id}", details=changes, **ctx,
         )
 
     return UserResponse(**_user_dict(user))
+
+
+@router.post("/users/{user_id}/reset-password", status_code=204)
+async def reset_user_password(
+    user_id: str,
+    body: AdminPasswordResetRequest,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    user = await db.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    validate_password_strength(body.new_password)
+
+    user.password_hash = hash_password(body.new_password)
+    user.is_active = True
+    user.email_verified = True
+    if not user.email_verified_at:
+        user.email_verified_at = datetime.utcnow()
+
+    await db.commit()
+
+    ctx = {k: v for k, v in extract_request_context(request).items()
+           if k in ("ip", "user_agent", "request_id")}
+    await audit_record(
+        action=AuditAction.PASSWORD_CHANGED, status="success",
+        user_id=admin.id, user_email=admin.email,
+        resource=f"user:{user.id}",
+        details={"target_user": user.email, "admin_reset": True},
+        **ctx,
+    )
 
 
 @router.delete("/users/{user_id}", status_code=204)

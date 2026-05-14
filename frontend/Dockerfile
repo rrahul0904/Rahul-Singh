@@ -2,17 +2,15 @@ FROM node:20-alpine AS build
 
 WORKDIR /app
 
-RUN corepack enable
+RUN corepack enable && corepack prepare pnpm@9.12.3 --activate
 
-COPY package.json ./
+COPY package.json pnpm-lock.yaml ./
 
-RUN corepack prepare pnpm@9.12.3 --activate \
- && pnpm add -D vite@5.4.3 @vitejs/plugin-react@4.3.1 typescript@5.5.3 \
- && pnpm install
+RUN pnpm install --frozen-lockfile
 
 COPY . .
 
-RUN pnpm exec vite build
+RUN pnpm run build
 
 FROM nginx:1.27-alpine
 

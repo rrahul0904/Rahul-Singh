@@ -38,12 +38,23 @@ class EmailSendResult:
     reason: Optional[str] = None
 
 
-def _smtp_configured() -> bool:
+def smtp_configured() -> bool:
     return bool(settings.SMTP_HOST and (settings.SMTP_FROM_EMAIL or settings.SMTP_FROM))
 
 
+def verification_smtp_missing_fields() -> list[str]:
+    missing = []
+    if not settings.SMTP_HOST:
+        missing.append("SMTP_HOST")
+    if not settings.SMTP_FROM_EMAIL:
+        missing.append("SMTP_FROM_EMAIL")
+    if settings.SMTP_USER and not settings.SMTP_PASSWORD:
+        missing.append("SMTP_PASSWORD")
+    return missing
+
+
 def _send_email_sync(to_email: str, subject: str, text_body: str, html_body: Optional[str] = None) -> EmailSendResult:
-    if not _smtp_configured():
+    if not smtp_configured():
         logger.warning("SMTP is not configured; skipping outbound email to %s", to_email)
         return EmailSendResult(sent=False, skipped=True, reason="smtp_not_configured")
 
@@ -59,7 +70,12 @@ def _send_email_sync(to_email: str, subject: str, text_body: str, html_body: Opt
         msg.add_alternative(html_body, subtype="html")
 
     try:
-        if settings.SMTP_USE_TLS:
+        if settings.SMTP_USE_TLS and int(settings.SMTP_PORT) == 465:
+            with smtplib.SMTP_SSL(settings.SMTP_HOST, settings.SMTP_PORT, timeout=20) as smtp:
+                if settings.SMTP_USER:
+                    smtp.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+                smtp.send_message(msg)
+        elif settings.SMTP_USE_TLS:
             with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=20) as smtp:
                 smtp.ehlo()
                 smtp.starttls()

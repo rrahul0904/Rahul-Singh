@@ -68,6 +68,13 @@ pyarrow==17.0.0
 pandas==2.2.3
 openpyxl==3.1.5
 fastavro==1.9.7
+sqlglot==25.34.1
+faiss-cpu==1.8.0.post1
+
+# dbt Core validation runtime. Keep this on the 1.8 line so it remains
+# compatible with the existing Snowflake connector/SQLAlchemy stack.
+dbt-core>=1.8,<1.9
+dbt-snowflake>=1.8,<1.9
 
 # Crypto / secrets
 cryptography==43.0.3

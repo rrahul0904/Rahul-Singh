@@ -11,7 +11,14 @@ import logging
 import os
 import time
 
+from services.snowflake_connection import snowflake_connect_kwargs
+
 logger = logging.getLogger("uma.connectors.snowflake")
+
+
+def _mfa_required_error(err: str) -> bool:
+    lowered = (err or "").lower()
+    return "mfa with totp is required" in lowered or ("mfa" in lowered and "totp" in lowered and "required" in lowered)
 
 
 class SnowflakeConnector:
@@ -38,17 +45,11 @@ class SnowflakeConnector:
             os.environ["SSL_CERT_FILE"] = ca_bundle
         if insecure_mode:
             logger.warning("SNOWFLAKE_INSECURE_MODE=true; TLS certificate validation is disabled for local development")
-        self._conn = snowflake.connector.connect(
-            account=self.config["account"],
-            user=self.config["user"],
-            password=self.config.get("password", ""),
-            warehouse=self.config.get("warehouse", "COMPUTE_WH"),
-            database=self.config.get("database", ""),
-            schema=self.config.get("schema", ""),
-            role=self.config.get("role", ""),
-            session_parameters={"QUERY_TAG": "UMA_PLATFORM"},
-            insecure_mode=insecure_mode,
-        )
+        connect_kwargs = snowflake_connect_kwargs(self.config)
+        try:
+            self._conn = snowflake.connector.connect(**connect_kwargs)
+        finally:
+            self.config.pop("mfa_passcode", None)
         logger.info("Snowflake connection established")
 
     def disconnect(self) -> None:
@@ -88,7 +89,9 @@ class SnowflakeConnector:
             err = str(e)
             diagnostic = None
             lowered = err.lower()
-            if any(s in lowered for s in ("certificate verify failed", "self signed certificate", "tlsv1 alert", "ssl")):
+            if _mfa_required_error(err):
+                diagnostic = "Snowflake requires MFA/TOTP. Enter a current MFA code and rerun the diagnostic."
+            elif any(s in lowered for s in ("certificate verify failed", "self signed certificate", "tlsv1 alert", "ssl")):
                 diagnostic = (
                     "Snowflake TLS certificate validation failed. Ensure the container has ca-certificates installed, "
                     "set SNOWFLAKE_CA_BUNDLE or REQUESTS_CA_BUNDLE to your corporate CA bundle if TLS inspection is used, "
@@ -375,33 +378,33 @@ AUTO_REFRESH = TRUE
         return f"FILE_FORMAT = ({clause})"
 
 
-# ── Navigator helpers ─────────────────────────────────────
+    # ── Navigator helpers ─────────────────────────────────────
 
-def list_databases(self) -> List[str]:
-    with self._cursor() as cur:
-        cur.execute("SHOW DATABASES")
-        return [row["name"] for row in cur.fetchall()]
+    def list_databases(self) -> List[str]:
+        with self._cursor() as cur:
+            cur.execute("SHOW DATABASES")
+            return [row["name"] for row in cur.fetchall()]
 
-def list_schemas(self, database: str) -> List[str]:
-    with self._cursor() as cur:
-        cur.execute(f'SHOW SCHEMAS IN DATABASE "{database}"')
-        return [row["name"] for row in cur.fetchall()]
+    def list_schemas(self, database: str) -> List[str]:
+        with self._cursor() as cur:
+            cur.execute(f'SHOW SCHEMAS IN DATABASE "{database}"')
+            return [row["name"] for row in cur.fetchall()]
 
-def list_tables(self, database: str, schema: str) -> List[str]:
-    with self._cursor() as cur:
-        cur.execute(f'SHOW TABLES IN SCHEMA "{database}"."{schema}"')
-        return [row["name"] for row in cur.fetchall()]
+    def list_tables(self, database: str, schema: str) -> List[str]:
+        with self._cursor() as cur:
+            cur.execute(f'SHOW TABLES IN SCHEMA "{database}"."{schema}"')
+            return [row["name"] for row in cur.fetchall()]
 
-def describe_table(self, database: str, schema: str, table: str) -> List[Dict[str, Any]]:
-    with self._cursor() as cur:
-        cur.execute(f'DESCRIBE TABLE "{database}"."{schema}"."{table}"')
-        rows = cur.fetchall()
-        return [{"name": r.get("name"), "type": r.get("type"), "kind": r.get("kind"), "null?": r.get("null?"), "default": r.get("default")} for r in rows]
+    def describe_table(self, database: str, schema: str, table: str) -> List[Dict[str, Any]]:
+        with self._cursor() as cur:
+            cur.execute(f'DESCRIBE TABLE "{database}"."{schema}"."{table}"')
+            rows = cur.fetchall()
+            return [{"name": r.get("name"), "type": r.get("type"), "kind": r.get("kind"), "null?": r.get("null?"), "default": r.get("default")} for r in rows]
 
-def preview_table(self, database: str, schema: str, table: str, limit: int = 100) -> Dict[str, Any]:
-    with self._cursor() as cur:
-        cur.execute(f'SELECT * FROM "{database}"."{schema}"."{table}" LIMIT {int(limit)}')
-        rows = cur.fetchall()
-        cols = list(rows[0].keys()) if rows else []
-        out_rows = [[row.get(c) for c in cols] for row in rows]
-        return {"columns": cols, "rows": out_rows, "row_count": len(out_rows)}
+    def preview_table(self, database: str, schema: str, table: str, limit: int = 100) -> Dict[str, Any]:
+        with self._cursor() as cur:
+            cur.execute(f'SELECT * FROM "{database}"."{schema}"."{table}" LIMIT {int(limit)}')
+            rows = cur.fetchall()
+            cols = list(rows[0].keys()) if rows else []
+            out_rows = [[row.get(c) for c in cols] for row in rows]
+            return {"columns": cols, "rows": out_rows, "row_count": len(out_rows)}

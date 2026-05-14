@@ -28,9 +28,25 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from core.auth import get_current_user, require_editor
+from core.config import settings
 from core.database import get_db, AsyncSessionLocal
 from core.security import get_cipher
-from models import Connection, ConnectionType, Job, ValidationRule
+from models import Connection, ConnectionType, Job, ValidationRule, User
+from agents.tools.safety import is_read_only_sql, redact_secrets
+from services.ai import AiProviderRouter
+from services.ai.provider_router import parse_provider_json
+from services.rag.retriever import RagRetriever
+from api.routes.control_plane import (
+    ValidationRunCreate,
+    create_validation_run as create_control_plane_validation_run,
+    execute_validation as execute_control_plane_validation,
+    get_validation_report as get_control_plane_validation_report,
+    get_validation_results as get_control_plane_validation_results,
+    get_validation_run as get_control_plane_validation_run,
+    list_validation_runs as list_control_plane_validation_runs,
+    plan_validation as plan_control_plane_validation,
+)
 
 router = APIRouter()
 logger = logging.getLogger("uma.routes.validation")
@@ -55,6 +71,16 @@ class RuleCreate(BaseModel):
 class ReconcileRequest(BaseModel):
     job_id: str
     rule_types: list[str] = ["row_count"]  # may include "checksum"
+
+
+class AiSuggestChecksRequest(BaseModel):
+    provider: str | None = None
+    source_context: dict[str, Any] = {}
+    target_context: dict[str, Any] = {}
+    conversion_report: dict[str, Any] = {}
+    dbt_metadata: dict[str, Any] = {}
+    run_id: str | None = None
+    job_id: str | None = None
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -92,7 +118,11 @@ def _split_target_table(target: str, default_db: str, default_schema: str) -> tu
 # ─── CRUD ───────────────────────────────────────────────────────────────────
 
 @router.get("")
-async def list_rules(job_id: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+async def list_rules(
+    job_id: Optional[str] = None,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     q = select(ValidationRule).order_by(ValidationRule.created_at.desc())
     if job_id:
         q = q.where(ValidationRule.job_id == job_id)
@@ -101,7 +131,11 @@ async def list_rules(job_id: Optional[str] = None, db: AsyncSession = Depends(ge
 
 
 @router.post("", status_code=201)
-async def create_rule(body: RuleCreate, db: AsyncSession = Depends(get_db)):
+async def create_rule(
+    body: RuleCreate,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     rule = ValidationRule(
         name=body.name,
         rule_type=body.rule_type,
@@ -121,8 +155,134 @@ async def create_rule(body: RuleCreate, db: AsyncSession = Depends(get_db)):
     return _rule_dict(rule)
 
 
+@router.post("/runs", status_code=201)
+async def create_validation_control_run_alias(
+    body: ValidationRunCreate,
+    user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    return await create_control_plane_validation_run(body, user, db)
+
+
+@router.post("/runs/{run_id}/plan")
+async def plan_validation_control_run_alias(
+    run_id: str,
+    user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    return await plan_control_plane_validation(run_id, user, db)
+
+
+@router.post("/runs/{run_id}/execute")
+async def execute_validation_control_run_alias(
+    run_id: str,
+    user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    return await execute_control_plane_validation(run_id, user, db)
+
+
+@router.get("/runs")
+async def list_validation_control_runs_alias(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await list_control_plane_validation_runs(user, db)
+
+
+@router.get("/runs/{run_id}")
+async def get_validation_control_run_alias(
+    run_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await get_control_plane_validation_run(run_id, user, db)
+
+
+@router.get("/runs/{run_id}/results")
+async def get_validation_control_results_alias(
+    run_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await get_control_plane_validation_results(run_id, user, db)
+
+
+@router.get("/runs/{run_id}/report")
+async def get_validation_control_report_alias(
+    run_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await get_control_plane_validation_report(run_id, user, db)
+
+
+@router.post("/plans/{plan_id}/ai-suggest-checks")
+async def ai_suggest_validation_checks(
+    plan_id: str,
+    body: AiSuggestChecksRequest = AiSuggestChecksRequest(),
+    _user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    router = AiProviderRouter(body.provider)
+    status = await router.status()
+    rag = {}
+    if settings.RAG_ENABLED:
+        rag = await RagRetriever(db=db).search(
+            f"validation checks {plan_id} {body.source_context} {body.target_context}",
+            run_id=body.run_id,
+            job_id=body.job_id,
+            top_k=settings.RAG_MAX_RESULTS,
+        )
+    fallback = {
+        "plan_id": plan_id,
+        "available": False,
+        "provider": status.active_provider,
+        "suggested_validation_checks": [
+            {"type": "row_count", "description": "Compare source and target row counts."},
+            {"type": "null_check", "description": "Check nullable drift on business-critical columns."},
+            {"type": "duplicate_key", "description": "Check duplicate natural or configured primary keys."},
+            {"type": "aggregate", "description": "Compare totals and min/max timestamps on key measures."},
+            {"type": "date_window", "description": "Validate recent and historical date windows separately."},
+        ],
+        "generated_sql_preview": [],
+        "confidence": 0.0,
+        "manual_approval_required": True,
+        "rag_context": rag.get("chunks") or [],
+    }
+    if not status.chat_supported:
+        fallback["message"] = status.error or "No AI provider configured; deterministic suggestions returned."
+        return fallback
+    response = await router.chat(
+        [{"role": "user", "content": str({"plan_id": plan_id, "source": body.source_context, "target": body.target_context, "conversion_report": body.conversion_report, "dbt_metadata": body.dbt_metadata, "rag": rag.get("chunks") or [], "required_output": fallback})[:60000]}],
+        system="Suggest validation checks only. Do not run validation. Return JSON. Generated SQL preview must be safe read-only SQL only.",
+        json_mode=True,
+    )
+    if not response.available:
+        fallback["message"] = response.error or "Provider unavailable; deterministic suggestions returned."
+        return fallback
+    try:
+        parsed = parse_provider_json(response.content)
+    except Exception:
+        parsed = dict(fallback)
+        parsed["message"] = "Provider returned non-JSON content; deterministic suggestions returned."
+    parsed["provider"] = status.active_provider
+    parsed["manual_approval_required"] = True
+    parsed["rag_context"] = rag.get("chunks") or []
+    parsed["generated_sql_preview"] = [
+        sql
+        for sql in (parsed.get("generated_sql_preview") or [])
+        if isinstance(sql, str) and is_read_only_sql(sql)
+    ]
+    return redact_secrets(parsed)
+
+
 @router.get("/{rule_id}")
-async def get_rule(rule_id: str, db: AsyncSession = Depends(get_db)):
+async def get_rule(
+    rule_id: str,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     rule = await db.get(ValidationRule, rule_id)
     if not rule:
         raise HTTPException(404, "Rule not found")
@@ -130,7 +290,11 @@ async def get_rule(rule_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.delete("/{rule_id}", status_code=204)
-async def delete_rule(rule_id: str, db: AsyncSession = Depends(get_db)):
+async def delete_rule(
+    rule_id: str,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     rule = await db.get(ValidationRule, rule_id)
     if not rule:
         raise HTTPException(404, "Rule not found")
@@ -144,6 +308,7 @@ async def delete_rule(rule_id: str, db: AsyncSession = Depends(get_db)):
 async def run_rule(
     rule_id: str,
     background_tasks: BackgroundTasks,
+    _user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     rule = await db.get(ValidationRule, rule_id)
@@ -156,7 +321,11 @@ async def run_rule(
 
 
 @router.post("/reconcile")
-async def reconcile_job(body: ReconcileRequest, db: AsyncSession = Depends(get_db)):
+async def reconcile_job(
+    body: ReconcileRequest,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Auto-create row_count (and optionally checksum) rules for every task in a job,
     run them synchronously, return reconciliation summary.
 

@@ -79,7 +79,12 @@ async def select_engine(job_id: str, requested: EngineName = "auto") -> EngineSe
     )
 
 
-async def execute_job(job_id: str, requested_engine: EngineName = "auto") -> dict[str, Any]:
+async def execute_job(
+    job_id: str,
+    requested_engine: EngineName = "auto",
+    lease_holder: str | None = None,
+    user_id: str | None = None,
+) -> dict[str, Any]:
     """Execute a migration job using the selected engine."""
     selection = await select_engine(job_id, requested_engine)
     logger.info(
@@ -89,22 +94,51 @@ async def execute_job(job_id: str, requested_engine: EngineName = "auto") -> dic
         selection.reason,
     )
 
-    if selection.selected == "real":
-        from services.real_migration_engine import RealMigrationEngine
+    acquired_holder = lease_holder
+    if not acquired_holder:
+        from services.job_run_locks import acquire_job_run_lease
 
-        result = await RealMigrationEngine(job_id).execute()
-    else:
-        from services.job_engine import JobEngine
+        lease = await acquire_job_run_lease(job_id)
+        if not lease:
+            return {
+                "success": False,
+                "job_id": job_id,
+                "engine": selection.selected,
+                "engine_selection": asdict(selection),
+                "error": "Job is already running",
+                "conflict": True,
+            }
+        acquired_holder = lease.holder_id
 
-        await JobEngine(job_id).execute()
-        result = {"success": True}
+    try:
+        if selection.selected == "real":
+            from services.real_migration_engine import RealMigrationEngine
 
-    return {
-        **result,
-        "job_id": job_id,
-        "engine": selection.selected,
-        "engine_selection": asdict(selection),
-    }
+            result = await RealMigrationEngine(job_id, lease_holder=acquired_holder, user_id=user_id).execute()
+        else:
+            from services.job_engine import JobEngine
+
+            await JobEngine(job_id).execute()
+            result = {"success": True}
+
+        try:
+            from services.managed_syncs import finalize_sync_run_for_job
+
+            await finalize_sync_run_for_job(job_id, result)
+        except Exception:
+            logger.warning("Failed to finalize managed sync run for job %s", job_id, exc_info=True)
+
+        return {
+            **result,
+            "job_id": job_id,
+            "engine": selection.selected,
+            "engine_selection": asdict(selection),
+        }
+    finally:
+        if acquired_holder:
+            from services.job_run_locks import release_job_run_lease
+
+            await release_job_run_lease(job_id, acquired_holder)
 
 
 async def execution_capabilities() -> dict[str, Any]:

@@ -2,14 +2,22 @@ from datetime import datetime
 from typing import Optional
 
 from croniter import croniter
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.auth import get_current_user, require_editor
 from core.database import get_db
-from models import SyncProfile, SyncRun, Connection, User
+from models import Connection, ConnectionType, DestinationMode, SyncProfile, SyncRun, User
+from services.managed_syncs import (
+    build_task_config,
+    create_or_update_managed_job,
+    create_running_sync_run,
+    delete_managed_job,
+    mark_sync_run_failed,
+    sync_mode_to_load_strategy,
+)
 
 router = APIRouter()
 
@@ -18,6 +26,14 @@ class SyncProfileCreate(BaseModel):
     name: str = Field(min_length=2)
     source_connection_id: str
     dest_connection_id: str
+    source_dataset: str = Field(min_length=1)
+    source_table: str = Field(min_length=1)
+    target_schema: str = Field(min_length=1)
+    target_table: str = Field(min_length=1)
+    primary_key_columns: list[str] = []
+    watermark_column: Optional[str] = None
+    delete_flag_column: Optional[str] = None
+    batch_size: int = 50000
     mode: str = "incremental"
     cadence: str = "0 2 * * *"
     schema_drift_policy: str = "warn"
@@ -28,6 +44,14 @@ class SyncProfileUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=2)
     source_connection_id: Optional[str] = None
     dest_connection_id: Optional[str] = None
+    source_dataset: Optional[str] = None
+    source_table: Optional[str] = None
+    target_schema: Optional[str] = None
+    target_table: Optional[str] = None
+    primary_key_columns: Optional[list[str]] = None
+    watermark_column: Optional[str] = None
+    delete_flag_column: Optional[str] = None
+    batch_size: Optional[int] = None
     mode: Optional[str] = None
     cadence: Optional[str] = None
     schema_drift_policy: Optional[str] = None
@@ -60,6 +84,12 @@ def _profile_dict(profile: SyncProfile, source: Optional[Connection] = None, des
         "name": profile.name,
         "source_connection_id": profile.source_connection_id,
         "dest_connection_id": profile.dest_connection_id,
+        "job_id": profile.job_id,
+        "source_dataset": profile.source_dataset,
+        "source_table": profile.source_table,
+        "target_schema": profile.target_schema,
+        "target_table": profile.target_table,
+        "task_config": profile.task_config or {},
         "source_connection_name": source.name if source else None,
         "dest_connection_name": dest.name if dest else None,
         "mode": profile.mode,
@@ -98,6 +128,47 @@ async def _load_profile_context(db: AsyncSession, profile: SyncProfile):
     )
     runs = list(run_rows.scalars().all())
     return _profile_dict(profile, src, dest, runs), runs
+
+
+def _normalize_task_config(payload: SyncProfileCreate | SyncProfileUpdate, existing: Optional[dict] = None) -> dict:
+    base = dict(existing or {})
+    if hasattr(payload, "primary_key_columns") and payload.primary_key_columns is not None:
+        base["primary_key_columns"] = [c.strip() for c in payload.primary_key_columns if str(c).strip()]
+    if hasattr(payload, "watermark_column") and payload.watermark_column is not None:
+        base["watermark_column"] = payload.watermark_column.strip() or None
+    if hasattr(payload, "delete_flag_column") and payload.delete_flag_column is not None:
+        base["delete_flag_column"] = payload.delete_flag_column.strip() or None
+    if hasattr(payload, "batch_size") and payload.batch_size is not None:
+        base["batch_size"] = int(payload.batch_size or 50000)
+    return build_task_config(
+        primary_key_columns=base.get("primary_key_columns") or [],
+        watermark_column=base.get("watermark_column"),
+        delete_flag_column=base.get("delete_flag_column"),
+        batch_size=int(base.get("batch_size") or 50000),
+    )
+
+
+async def _validate_sync_connections(
+    db: AsyncSession, source_connection_id: str, dest_connection_id: str
+) -> tuple[Connection, Connection]:
+    src = await db.get(Connection, source_connection_id)
+    dest = await db.get(Connection, dest_connection_id)
+    if not src or not dest:
+        raise HTTPException(400, "Source and destination connections must exist")
+    if dest.type != ConnectionType.snowflake:
+        raise HTTPException(400, "Managed syncs currently require a Snowflake destination")
+    if src.type not in {ConnectionType.postgres, ConnectionType.mysql, ConnectionType.redshift, ConnectionType.bigquery}:
+        raise HTTPException(400, f"Managed syncs do not yet support {src.type.value} as a source")
+    return src, dest
+
+
+async def _execute_profile_job(profile_id: str, job_id: str, sync_run_id: str):
+    try:
+        from services.migration_orchestrator import execute_job as execute_migration_job
+
+        await execute_migration_job(job_id, "real")
+    except Exception as exc:
+        await mark_sync_run_failed(profile_id, sync_run_id, str(exc))
 
 
 @router.get("/templates")
@@ -170,13 +241,32 @@ async def create_profile(body: SyncProfileCreate, user: User = Depends(require_e
         raise HTTPException(400, "Invalid destination mode")
     if _next_run(body.cadence) is None:
         raise HTTPException(400, "Invalid cron cadence")
-
-    src = await db.get(Connection, body.source_connection_id)
-    dest = await db.get(Connection, body.dest_connection_id)
-    if not src or not dest:
-        raise HTTPException(400, "Source and destination connections must exist")
-    p = SyncProfile(**body.model_dump(), created_by=user.id)
+    _, dest = await _validate_sync_connections(db, body.source_connection_id, body.dest_connection_id)
+    task_config = _normalize_task_config(body)
+    p = SyncProfile(
+        name=body.name,
+        source_connection_id=body.source_connection_id,
+        dest_connection_id=body.dest_connection_id,
+        source_dataset=body.source_dataset.strip(),
+        source_table=body.source_table.strip(),
+        target_schema=body.target_schema.strip(),
+        target_table=body.target_table.strip(),
+        task_config=task_config,
+        mode=body.mode,
+        cadence=body.cadence,
+        schema_drift_policy=body.schema_drift_policy,
+        destination_mode=body.destination_mode,
+        created_by=user.id,
+    )
     db.add(p)
+    await db.flush()
+    p.job_id = await create_or_update_managed_job(
+        p,
+        dest.config,
+        load_strategy=sync_mode_to_load_strategy(body.mode),
+        destination_mode=DestinationMode(body.destination_mode),
+        is_active=True,
+    )
     await db.commit()
     await db.refresh(p)
     profile, _ = await _load_profile_context(db, p)
@@ -219,14 +309,26 @@ async def update_profile(profile_id: str, body: SyncProfileUpdate, _: User = Dep
         raise HTTPException(400, "Invalid destination mode")
     if "cadence" in updates and _next_run(updates["cadence"]) is None:
         raise HTTPException(400, "Invalid cron cadence")
-    if "source_connection_id" in updates and not await db.get(Connection, updates["source_connection_id"]):
-        raise HTTPException(400, "Source connection not found")
-    if "dest_connection_id" in updates and not await db.get(Connection, updates["dest_connection_id"]):
-        raise HTTPException(400, "Destination connection not found")
+
+    src_id = updates.get("source_connection_id", p.source_connection_id)
+    dst_id = updates.get("dest_connection_id", p.dest_connection_id)
+    _, dest = await _validate_sync_connections(db, src_id, dst_id)
 
     for key, value in updates.items():
         setattr(p, key, value)
+    if any(k in updates for k in ("primary_key_columns", "watermark_column", "delete_flag_column", "batch_size")):
+        p.task_config = _normalize_task_config(body, p.task_config or {})
+    elif not p.task_config:
+        p.task_config = _normalize_task_config(body, {})
     p.updated_at = datetime.utcnow()
+
+    p.job_id = await create_or_update_managed_job(
+        p,
+        dest.config,
+        load_strategy=sync_mode_to_load_strategy(p.mode),
+        destination_mode=DestinationMode(p.destination_mode),
+        is_active=p.is_active,
+    )
     await db.commit()
     await db.refresh(p)
     profile, _ = await _load_profile_context(db, p)
@@ -238,6 +340,12 @@ async def delete_profile(profile_id: str, _: User = Depends(require_editor), db:
     p = await db.get(SyncProfile, profile_id)
     if not p:
         raise HTTPException(404, "Sync profile not found")
+    job_id = p.job_id
+    if job_id:
+        try:
+            await delete_managed_job(job_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
     await db.delete(p)
     await db.commit()
 
@@ -258,29 +366,19 @@ async def get_runs(profile_id: str, _: User = Depends(get_current_user), db: Asy
 
 
 @router.post("/profiles/{profile_id}/run")
-async def run_profile(profile_id: str, _: User = Depends(require_editor), db: AsyncSession = Depends(get_db)):
+async def run_profile(
+    profile_id: str,
+    background_tasks: BackgroundTasks,
+    _: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
     p = await db.get(SyncProfile, profile_id)
     if not p:
         raise HTTPException(404, "Sync profile not found")
-
-    now = datetime.utcnow()
-    base_rows = {"full_refresh": 240000, "incremental": 12500, "cdc": 3800}.get(p.mode, 12500)
-    base_bytes = {"full_refresh": 734003200, "incremental": 52428800, "cdc": 9437184}.get(p.mode, 52428800)
-    status = "SUCCEEDED"
-    error_message = ""
-    if p.schema_drift_policy == "block" and p.mode == "cdc":
-        status = "FAILED"
-        error_message = "Blocked by schema drift policy — destination requires manual review before continuing."
-    run = SyncRun(
-        profile_id=profile_id,
-        status=status,
-        rows_synced=0 if status == "FAILED" else base_rows,
-        bytes_synced=0 if status == "FAILED" else base_bytes,
-        started_at=now,
-        ended_at=now,
-        error_message=error_message,
-    )
-    db.add(run)
-    p.updated_at = now
+    if not p.job_id:
+        raise HTTPException(409, "Sync profile is not bound to a managed migration job")
+    sync_run_id = await create_running_sync_run(profile_id)
+    p.updated_at = datetime.utcnow()
     await db.commit()
-    return {"success": status == "SUCCEEDED", "run_id": run.id, "status": status, "error_message": error_message}
+    background_tasks.add_task(_execute_profile_job, profile_id, p.job_id, sync_run_id)
+    return {"success": True, "run_id": sync_run_id, "status": "RUNNING", "job_id": p.job_id}

@@ -35,12 +35,13 @@ def test_all_routes_import():
     """Every route module must import."""
     from api.routes import (
         auth, connections, jobs, tables, validation, ai, health,
-        snowflake, projects, drift, demo, settings, syncs,
+        snowflake, projects, drift, settings, syncs, copilot,
+        replication, control_plane,
     )
     # Each should expose a router
     for module_name in ("auth", "connections", "jobs", "tables", "validation",
                         "ai", "health", "snowflake", "projects", "drift",
-                        "demo", "settings", "syncs"):
+                        "settings", "syncs", "copilot", "replication", "control_plane"):
         mod = __import__(f"api.routes.{module_name}", fromlist=["router"])
         assert hasattr(mod, "router"), f"{module_name} missing router"
 
@@ -56,13 +57,24 @@ def test_fastapi_app_builds():
         "/api/health/services",
         "/api/auth/login",
         "/api/auth/register",
+        "/api/auth/change-password",
+        "/api/auth/users/{user_id}/reset-password",
         "/api/connections",
         "/api/jobs",
         "/api/snowflake/query",
         "/api/snowflake/diagnose",
+        "/api/snowflake/readiness",
         "/api/drift/check",
         "/api/drift/check-adhoc",
         "/api/syncs/profiles",
+        "/api/replication/overview",
+        "/api/replication/jobs",
+        "/api/copilot/providers",
+        "/api/copilot/snowflake-services",
+        "/api/control-plane/runs",
+        "/api/sql-conversion/runs",
+        "/api/migration-intelligence/runs",
+        "/api/provision/runs",
     ]
     for p in required:
         assert any(p in pp for pp in paths), f"Route {p} not registered"
@@ -154,6 +166,69 @@ def test_snowflake_diagnose_bad_account():
     assert result["ok"] is False
 
 
+def test_snowflake_mfa_request_schema():
+    from api.routes.snowflake import SnowflakeDiagnosticRequest
+
+    body = SnowflakeDiagnosticRequest(
+        account="example-account.us-east-1",
+        user="example_user",
+        password="secret",
+        warehouse="COMPUTE_WH",
+        auth_method="password_mfa",
+        mfa_passcode="123456",
+    )
+    assert body.auth_method == "password_mfa"
+    assert body.mfa_passcode == "123456"
+
+
+def test_snowflake_connector_maps_mfa_passcode():
+    from connectors.snowflake_connector import SnowflakeConnector
+    from unittest.mock import MagicMock, patch
+
+    fake_conn = MagicMock()
+    connector = SnowflakeConnector({
+        "account": "example-account.us-east-1",
+        "user": "example_user",
+        "password": "secret",
+        "warehouse": "COMPUTE_WH",
+        "auth_method": "password_mfa",
+        "mfa_passcode": "123456",
+    })
+    with patch("snowflake.connector.connect", return_value=fake_conn) as connect:
+        connector.connect()
+
+    assert connect.call_args.kwargs["passcode"] == "123456"
+    assert "mfa_passcode" not in connector.config
+
+
+def test_snowflake_workspace_session_schema():
+    from api.routes.snowflake import QueryRequest, SnowflakeRuntimeAuth, SnowflakeWorkspaceSessionRequest
+
+    session = SnowflakeWorkspaceSessionRequest(
+        connection_id="conn-123",
+        auth_method="password_mfa",
+        mfa_passcode="123456",
+    )
+    runtime = SnowflakeRuntimeAuth(workspace_session_id="session-123")
+    query = QueryRequest(sql="SELECT 1", connection_id="conn-123", workspace_session_id="session-123")
+
+    assert session.auth_method == "password_mfa"
+    assert session.mfa_passcode == "123456"
+    assert runtime.workspace_session_id == "session-123"
+    assert query.workspace_session_id == "session-123"
+
+
+def test_mfa_passcode_not_persisted_in_connection_payloads():
+    from api.routes.connections import _strip_ephemeral_credentials
+
+    assert _strip_ephemeral_credentials({
+        "user": "Rahul",
+        "password": "secret",
+        "mfa_passcode": "123456",
+        "passcode": "654321",
+    }) == {"user": "Rahul", "password": "secret"}
+
+
 def test_password_policy_rejects_weak():
     from api.routes.auth import validate_password_strength
     from fastapi import HTTPException
@@ -170,6 +245,13 @@ def test_password_policy_rejects_weak():
 
     # Valid should not raise
     validate_password_strength("CorrectHorse123!")
+
+
+def test_admin_password_reset_schema():
+    from api.routes.auth import AdminPasswordResetRequest
+
+    body = AdminPasswordResetRequest(new_password="CorrectHorse123!")
+    assert body.new_password == "CorrectHorse123!"
 
 
 def test_models_register_correctly():
@@ -202,6 +284,60 @@ def test_credential_encryption_roundtrip():
     assert enc.get("__encrypted__") is True
     dec = cipher.decrypt_dict(enc)
     assert dec == creds
+
+
+def test_production_rejects_default_secret_key(monkeypatch):
+    from core.config import Settings
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("SECRET_KEY", "replace-with-a-random-64-char-secret")
+    monkeypatch.setenv("UMA_ENCRYPTION_KEY", "cY3Kn2QdFYz7-h6m0u8rLsVqW8Yz4kNd1MpXa9QrStU=")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://uma:uma@db.example.com:5432/uma")
+
+    with pytest.raises(ValueError, match="SECRET_KEY"):
+        Settings(_env_file=None)
+
+
+def test_production_requires_valid_encryption_key(monkeypatch):
+    from core.config import Settings
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("SECRET_KEY", "prod-secret-key-with-more-than-thirty-two-characters")
+    monkeypatch.setenv("UMA_ENCRYPTION_KEY", "replace-with-a-fernet-key-generated-for-this-install")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://uma:uma@db.example.com:5432/uma")
+
+    with pytest.raises(ValueError, match="UMA_ENCRYPTION_KEY"):
+        Settings(_env_file=None)
+
+
+def test_production_rejects_default_database_url(monkeypatch):
+    from core.config import Settings
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("SECRET_KEY", "prod-secret-key-with-more-than-thirty-two-characters")
+    monkeypatch.setenv("UMA_ENCRYPTION_KEY", "cY3Kn2QdFYz7-h6m0u8rLsVqW8Yz4kNd1MpXa9QrStU=")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://uma:uma@postgres:5432/uma")
+
+    with pytest.raises(ValueError, match="DATABASE_URL"):
+        Settings(_env_file=None)
+
+
+def test_env_example_contains_only_safe_placeholders():
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "..", ".env.example"),
+        os.path.join(os.path.dirname(__file__), "..", "backend", ".env.example"),
+        os.path.join(os.getcwd(), ".env.example"),
+        os.path.join(os.getcwd(), "backend", ".env.example"),
+    ]
+    env_example = next((path for path in candidates if os.path.exists(path)), None)
+    assert env_example is not None
+    contents = open(env_example, encoding="utf-8").read()
+
+    assert "sk-your-openai-key" not in contents
+    assert "your_snowflake_password" not in contents
+    assert "SNOWFLAKE_PASSWORD=\n" in contents
+    assert "OPENAI_API_KEY=\n" in contents
+    assert "UMA_ENCRYPTION_KEY=replace-with-a-fernet-key-generated-for-this-install" in contents
 
 
 if __name__ == "__main__":

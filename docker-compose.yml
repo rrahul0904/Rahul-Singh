@@ -15,7 +15,7 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U uma"]
+      test: [ "CMD-SHELL", "pg_isready -U uma" ]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -29,10 +29,18 @@ services:
     ports:
       - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 5
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: uma-mailpit
+    restart: unless-stopped
+    ports:
+      - "1025:1025"
+      - "8025:8025"
 
   api:
     build:
@@ -49,6 +57,14 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://uma:uma@postgres:5432/uma
       REDIS_URL: redis://redis:6379/0
+      SNOWFLAKE_CA_BUNDLE: /app/certs/combined-ca.pem
+      SSL_CERT_FILE: /app/certs/combined-ca.pem
+      REQUESTS_CA_BUNDLE: /app/certs/combined-ca.pem
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      AI_PROVIDER: ${AI_PROVIDER:-offline_deterministic}
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_CHAT_MODEL: ${AI_CHAT_MODEL:-}
     ports:
       - "8000:8000"
     depends_on:
@@ -56,11 +72,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      mailpit:
+        condition: service_started
     volumes:
       - ./backend:/app
+      - ./certs:/app/certs:ro
       - uma_uploads:/app/uploads
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/api/health" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -72,12 +91,13 @@ services:
     container_name: uma-frontend
     restart: unless-stopped
     ports:
-      - "5173:5173"
+      - "80:5173"
+      - "5174:5173"
     depends_on:
       api:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:5173 >/dev/null || exit 1"]
+      test: [ "CMD-SHELL", "curl -fsS http://127.0.0.1:5173 >/dev/null || exit 1" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -98,6 +118,14 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://uma:uma@postgres:5432/uma
       REDIS_URL: redis://redis:6379/0
+      SNOWFLAKE_CA_BUNDLE: /app/certs/combined-ca.pem
+      SSL_CERT_FILE: /app/certs/combined-ca.pem
+      REQUESTS_CA_BUNDLE: /app/certs/combined-ca.pem
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      AI_PROVIDER: ${AI_PROVIDER:-offline_deterministic}
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_CHAT_MODEL: ${AI_CHAT_MODEL:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -105,13 +133,56 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
+      - ./certs:/app/certs:ro
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"from redis import Redis; from core.config import settings; raise SystemExit(0 if Redis.from_url(settings.REDIS_URL).ping() else 1)\""]
+      test: [ "CMD-SHELL", "python -c \"from redis import Redis; from core.config import settings; raise SystemExit(0 if Redis.from_url(settings.REDIS_URL).ping() else 1)\"" ]
       interval: 15s
       timeout: 5s
       retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: uma-ollama
+    restart: unless-stopped
+    profiles:
+      - ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: uma-vllm
+    restart: unless-stopped
+    profiles:
+      - vllm
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    command:
+      - --model
+      - ${VLLM_MODEL:-Qwen/Qwen2.5-Coder-32B-Instruct}
+      - --served-model-name
+      - ${AI_CHAT_MODEL:-Qwen/Qwen2.5-Coder-32B-Instruct}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "8001:8000"
+    volumes:
+      - vllm_models:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
 volumes:
   postgres_data:
   redis_data:
   uma_uploads:
+  ollama_models:
+  vllm_models:

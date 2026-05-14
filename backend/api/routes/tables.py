@@ -3,8 +3,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from typing import Optional
 
+from core.auth import get_current_user
 from core.database import get_db
-from models import JobTask, TaskStatus
+from models import JobTask, TaskStatus, User
 
 router = APIRouter()
 
@@ -16,6 +17,7 @@ async def list_tables(
     search: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
+    _user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     q = select(JobTask).limit(limit).offset(offset)
@@ -39,7 +41,10 @@ async def list_tables(
 
 
 @router.get("/stats")
-async def table_stats(db: AsyncSession = Depends(get_db)):
+async def table_stats(
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(
         select(JobTask.status, func.count(JobTask.id)).group_by(JobTask.status)
     )

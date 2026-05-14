@@ -53,12 +53,20 @@ from models import (
     JobTask,
     LoadStrategy,
     LogLevel,
+    MigrationChunkManifest,
+    MigrationCostActual,
+    MigrationCostEstimate,
     MigrationRun,
+    MigrationRunEvent,
+    MigrationSchemaDriftResult,
+    MigrationSnowflakeQuery,
     MigrationState,
     MigrationTaskRun,
+    MigrationValidationResult,
     TaskStatus,
     ValidationRule,
 )
+from services.snowflake_connection import normalize_snowflake_config, snowflake_auth_method, snowflake_connect_kwargs
 
 logger = logging.getLogger("uma.real_migration")
 
@@ -126,6 +134,8 @@ class ChunkResult:
     rows: int
     bytes: int
     batch_index: int
+    last_watermark: Any = None
+    last_primary_key: Any = None
 
 
 @dataclass
@@ -163,6 +173,46 @@ class TableSchema:
         return None
 
 
+def _serialize_cursor_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    return str(value)
+
+
+def _coerce_cursor_value(spec: Optional[ColumnSpec], value: Any) -> Any:
+    if value is None or not isinstance(value, str):
+        return value
+    t = (spec.type if spec else "").lower()
+    try:
+        if any(x in t for x in ("int", "integer", "bigint", "smallint")):
+            return int(value)
+        if any(x in t for x in ("numeric", "decimal", "number", "float", "double", "real")):
+            return float(value)
+        if "date" in t or "time" in t:
+            return datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    return value
+
+
+def _state_last_primary_key(state: MigrationState) -> Any:
+    metadata = state.state_json or {}
+    return metadata.get("last_primary_key_value")
+
+
+def _set_state_last_primary_key(state: MigrationState, value: Any) -> None:
+    metadata = dict(state.state_json or {})
+    metadata["last_primary_key_value"] = _serialize_cursor_value(value)
+    state.state_json = metadata
+
+
 # ─── Source adapters ────────────────────────────────────────────────────────
 
 class SourceAdapter:
@@ -175,10 +225,30 @@ class SourceAdapter:
     def row_count(self, dataset: str, table: str) -> int:
         raise NotImplementedError
 
+    def active_row_count(self, dataset: str, table: str, delete_flag_column: Optional[str]) -> int:
+        return self.row_count(dataset, table)
+
     def min_max(self, dataset: str, table: str, column: str) -> tuple[Any, Any]:
         raise NotImplementedError
 
-    def max_watermark(self, dataset: str, table: str, column: str, start_value: Any) -> Any:
+    def active_min_max(
+        self,
+        dataset: str,
+        table: str,
+        column: str,
+        delete_flag_column: Optional[str],
+    ) -> tuple[Any, Any]:
+        return self.min_max(dataset, table, column)
+
+    def max_watermark(
+        self,
+        dataset: str,
+        table: str,
+        column: str,
+        start_value: Any,
+        primary_key_column: Optional[str] = None,
+        start_primary_key: Any = None,
+    ) -> Any:
         raise NotImplementedError
 
     def extract_chunks(
@@ -189,6 +259,7 @@ class SourceAdapter:
         plan: TablePlan,
         schema: TableSchema,
         start_watermark: Any,
+        start_primary_key: Any,
         end_watermark: Any,
         out_dir: Path,
     ) -> Iterable[ChunkResult]:
@@ -205,7 +276,7 @@ class BigQuerySourceAdapter(SourceAdapter):
 
         cipher = get_cipher()
         credentials = cipher.decrypt_dict(conn.credentials) if conn.credentials else {}
-        cfg = {**(conn.config or {}), **credentials}
+        cfg = normalize_snowflake_config({**(conn.config or {}), **credentials})
         sa_json = cfg.get("service_account_json")
         if isinstance(sa_json, str):
             sa_info = json.loads(sa_json)
@@ -233,14 +304,68 @@ class BigQuerySourceAdapter(SourceAdapter):
         ]
         return TableSchema(cols)
 
-    @_retry()
-    def max_watermark(self, dataset: str, table: str, column: str, start_value: Any) -> Any:
+    def _bq_param_type(self, spec: Optional[ColumnSpec]) -> str:
+        t = (spec.type if spec else "STRING").upper()
+        if "INT" in t:
+            return "INT64"
+        if any(x in t for x in ("NUMERIC", "DECIMAL", "BIGNUMERIC")):
+            return "NUMERIC"
+        if any(x in t for x in ("FLOAT", "DOUBLE")):
+            return "FLOAT64"
+        if t == "DATE":
+            return "DATE"
+        if "TIMESTAMP" in t:
+            return "TIMESTAMP"
+        if "DATETIME" in t:
+            return "DATETIME"
+        if "BOOL" in t:
+            return "BOOL"
+        return "STRING"
+
+    def _bq_param_expr(self, name: str, spec: Optional[ColumnSpec], value: Any) -> str:
+        typ = self._bq_param_type(spec)
+        if isinstance(value, str) and typ != "STRING":
+            return f"CAST(@{name} AS {typ})"
+        return f"@{name}"
+
+    def _bq_param(self, name: str, spec: Optional[ColumnSpec], value: Any):
         from google.cloud import bigquery
+        typ = self._bq_param_type(spec)
+        if isinstance(value, str) and typ != "STRING":
+            typ = "STRING"
+        return bigquery.ScalarQueryParameter(name, typ, value)
+
+    @_retry()
+    def max_watermark(
+        self,
+        dataset: str,
+        table: str,
+        column: str,
+        start_value: Any,
+        primary_key_column: Optional[str] = None,
+        start_primary_key: Any = None,
+    ) -> Any:
+        from google.cloud import bigquery
+        schema = self.schema(dataset, table)
         params: list[Any] = []
         where = ""
-        if start_value is not None:
-            params.append(bigquery.ScalarQueryParameter("start_value", "STRING", str(start_value)))
-            where = f"WHERE CAST(`{column}` AS STRING) > @start_value"
+        if start_value is not None and primary_key_column and start_primary_key is not None:
+            wm_spec = schema.get(column)
+            pk_spec = schema.get(primary_key_column)
+            start_value = _coerce_cursor_value(wm_spec, start_value)
+            start_primary_key = _coerce_cursor_value(pk_spec, start_primary_key)
+            params.append(self._bq_param("start_value", wm_spec, start_value))
+            params.append(self._bq_param("start_pk", pk_spec, start_primary_key))
+            start_expr = self._bq_param_expr("start_value", wm_spec, start_value)
+            pk_expr = self._bq_param_expr("start_pk", pk_spec, start_primary_key)
+            where = (
+                f"WHERE (`{column}` > {start_expr} OR "
+                f"(`{column}` = {start_expr} AND `{primary_key_column}` > {pk_expr}))"
+            )
+        elif start_value is not None:
+            wm_spec = schema.get(column)
+            params.append(self._bq_param("start_value", wm_spec, start_value))
+            where = f"WHERE `{column}` > {self._bq_param_expr('start_value', wm_spec, start_value)}"
         sql = f"SELECT MAX(`{column}`) AS wm FROM {self._table_ref(dataset, table)} {where}"
         rows = list(
             self.client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
@@ -251,41 +376,83 @@ class BigQuerySourceAdapter(SourceAdapter):
         rows = list(self.client.query(f"SELECT COUNT(*) AS cnt FROM {self._table_ref(dataset, table)}").result())
         return int(rows[0]["cnt"] or 0) if rows else 0
 
+    def active_row_count(self, dataset: str, table: str, delete_flag_column: Optional[str]) -> int:
+        if not delete_flag_column:
+            return self.row_count(dataset, table)
+        rows = list(self.client.query(
+            f"SELECT COUNT(*) AS cnt FROM {self._table_ref(dataset, table)} "
+            f"WHERE COALESCE(CAST(`{delete_flag_column}` AS BOOL), FALSE) = FALSE"
+        ).result())
+        return int(rows[0]["cnt"] or 0) if rows else 0
+
     def min_max(self, dataset: str, table: str, column: str) -> tuple[Any, Any]:
         rows = list(self.client.query(
             f"SELECT MIN(`{column}`) AS min_v, MAX(`{column}`) AS max_v FROM {self._table_ref(dataset, table)}"
         ).result())
         return (rows[0]["min_v"], rows[0]["max_v"]) if rows else (None, None)
 
-    def extract_chunks(self, dataset, table, columns, plan, schema, start_watermark, end_watermark, out_dir):
-        """BigQuery keyset pagination using the watermark column or first PK column.
+    def active_min_max(
+        self,
+        dataset: str,
+        table: str,
+        column: str,
+        delete_flag_column: Optional[str],
+    ) -> tuple[Any, Any]:
+        if not delete_flag_column:
+            return self.min_max(dataset, table, column)
+        rows = list(self.client.query(
+            f"SELECT MIN(`{column}`) AS min_v, MAX(`{column}`) AS max_v "
+            f"FROM {self._table_ref(dataset, table)} "
+            f"WHERE COALESCE(CAST(`{delete_flag_column}` AS BOOL), FALSE) = FALSE"
+        ).result())
+        return (rows[0]["min_v"], rows[0]["max_v"]) if rows else (None, None)
 
-        We page using `WHERE sort_key > @cursor` rather than OFFSET, which keeps
-        the read consistent under concurrent writes and avoids quadratic plans.
+    def extract_chunks(self, dataset, table, columns, plan, schema, start_watermark, start_primary_key, end_watermark, out_dir):
+        """BigQuery keyset pagination using watermark + primary key when present.
+
+        OFFSET is never used. Incremental loads use a composite cursor so rows
+        sharing the same watermark across batch boundaries are not skipped.
         """
         from google.cloud import bigquery
 
         select_cols = ", ".join(f"`{c}`" for c in columns)
-        sort_col = plan.watermark_column or (plan.pk_columns[0] if plan.pk_columns else columns[0])
+        pk_col = plan.pk_columns[0] if plan.pk_columns else None
+        sort_col = plan.watermark_column or pk_col or columns[0]
+        wm_spec = schema.get(plan.watermark_column) if plan.watermark_column else None
+        pk_spec = schema.get(pk_col) if pk_col else None
+        order_cols = [plan.watermark_column, pk_col] if plan.watermark_column and pk_col else [sort_col]
+        order_by = ", ".join(f"`{c}`" for c in order_cols if c)
 
-        cursor: Any = start_watermark
+        cursor_wm: Any = start_watermark
+        cursor_pk: Any = start_primary_key
         end_wm = end_watermark
         batch = 0
         while True:
             params: list[Any] = []
             preds: list[str] = []
-            if cursor is not None:
-                params.append(bigquery.ScalarQueryParameter("cursor", "STRING", str(cursor)))
-                preds.append(f"CAST(`{sort_col}` AS STRING) > @cursor")
+            if plan.watermark_column and pk_col and cursor_wm is not None and cursor_pk is not None:
+                cursor_wm = _coerce_cursor_value(wm_spec, cursor_wm)
+                cursor_pk = _coerce_cursor_value(pk_spec, cursor_pk)
+                params.append(self._bq_param("cursor_wm", wm_spec, cursor_wm))
+                params.append(self._bq_param("cursor_pk", pk_spec, cursor_pk))
+                cursor_wm_expr = self._bq_param_expr("cursor_wm", wm_spec, cursor_wm)
+                cursor_pk_expr = self._bq_param_expr("cursor_pk", pk_spec, cursor_pk)
+                preds.append(
+                    f"(`{plan.watermark_column}` > {cursor_wm_expr} OR "
+                    f"(`{plan.watermark_column}` = {cursor_wm_expr} AND `{pk_col}` > {cursor_pk_expr}))"
+                )
+            elif cursor_wm is not None:
+                params.append(self._bq_param("cursor", schema.get(sort_col), cursor_wm))
+                preds.append(f"`{sort_col}` > {self._bq_param_expr('cursor', schema.get(sort_col), cursor_wm)}")
             if end_wm is not None and plan.watermark_column:
-                params.append(bigquery.ScalarQueryParameter("end_wm", "STRING", str(end_wm)))
-                preds.append(f"CAST(`{plan.watermark_column}` AS STRING) <= @end_wm")
+                params.append(self._bq_param("end_wm", wm_spec, end_wm))
+                preds.append(f"`{plan.watermark_column}` <= {self._bq_param_expr('end_wm', wm_spec, end_wm)}")
             where = "WHERE " + " AND ".join(preds) if preds else ""
             sql = f"""
                 SELECT {select_cols}
                 FROM {self._table_ref(dataset, table)}
                 {where}
-                ORDER BY `{sort_col}`
+                ORDER BY {order_by}
                 LIMIT {plan.batch_size}
             """
             try:
@@ -298,8 +465,11 @@ class BigQuerySourceAdapter(SourceAdapter):
                 break
             path = out_dir / f"batch_{batch:05d}.parquet"
             df.to_parquet(path, index=False)
-            yield ChunkResult(str(path), len(df), path.stat().st_size, batch)
-            cursor = df[sort_col].iloc[-1]
+            last_wm = df[plan.watermark_column].iloc[-1] if plan.watermark_column else df[sort_col].iloc[-1]
+            last_pk = df[pk_col].iloc[-1] if pk_col else None
+            yield ChunkResult(str(path), len(df), path.stat().st_size, batch, last_wm, last_pk)
+            cursor_wm = last_wm
+            cursor_pk = last_pk
             if len(df) < plan.batch_size:
                 break
             batch += 1
@@ -401,12 +571,29 @@ class SqlSourceAdapter(SourceAdapter):
         return TableSchema(cols)
 
     @_retry()
-    def max_watermark(self, dataset: str, table: str, column: str, start_value: Any) -> Any:
+    def max_watermark(
+        self,
+        dataset: str,
+        table: str,
+        column: str,
+        start_value: Any,
+        primary_key_column: Optional[str] = None,
+        start_primary_key: Any = None,
+    ) -> Any:
+        schema = self.schema(dataset, table)
         cur = self.conn.cursor()
         try:
             sql = f"SELECT MAX({self._qident(column)}) FROM {self._fqtn(dataset, table)}"
             params: list[Any] = []
-            if start_value is not None:
+            if start_value is not None and primary_key_column and start_primary_key is not None:
+                start_value = _coerce_cursor_value(schema.get(column), start_value)
+                start_primary_key = _coerce_cursor_value(schema.get(primary_key_column), start_primary_key)
+                sql += (
+                    f" WHERE ({self._qident(column)} > %s OR "
+                    f"({self._qident(column)} = %s AND {self._qident(primary_key_column)} > %s))"
+                )
+                params.extend([start_value, start_value, start_primary_key])
+            elif start_value is not None:
                 sql += f" WHERE {self._qident(column)} > %s"
                 params.append(start_value)
             cur.execute(sql, params)
@@ -425,6 +612,20 @@ class SqlSourceAdapter(SourceAdapter):
         finally:
             cur.close()
 
+    def active_row_count(self, dataset: str, table: str, delete_flag_column: Optional[str]) -> int:
+        if not delete_flag_column:
+            return self.row_count(dataset, table)
+        cur = self.conn.cursor()
+        try:
+            false_literal = "0" if self.conn_model.type == ConnectionType.mysql else "FALSE"
+            cur.execute(
+                f"SELECT COUNT(*) FROM {self._fqtn(dataset, table)} "
+                f"WHERE COALESCE({self._qident(delete_flag_column)}, {false_literal}) = {false_literal}"
+            )
+            return int(cur.fetchone()[0] or 0)
+        finally:
+            cur.close()
+
     def min_max(self, dataset: str, table: str, column: str) -> tuple[Any, Any]:
         cur = self.conn.cursor()
         try:
@@ -437,32 +638,67 @@ class SqlSourceAdapter(SourceAdapter):
         finally:
             cur.close()
 
-    def extract_chunks(self, dataset, table, columns, plan, schema, start_watermark, end_watermark, out_dir):
-        """SQL keyset pagination on watermark or first PK column.
+    def active_min_max(
+        self,
+        dataset: str,
+        table: str,
+        column: str,
+        delete_flag_column: Optional[str],
+    ) -> tuple[Any, Any]:
+        if not delete_flag_column:
+            return self.min_max(dataset, table, column)
+        cur = self.conn.cursor()
+        try:
+            false_literal = "0" if self.conn_model.type == ConnectionType.mysql else "FALSE"
+            cur.execute(
+                f"SELECT MIN({self._qident(column)}), MAX({self._qident(column)}) "
+                f"FROM {self._fqtn(dataset, table)} "
+                f"WHERE COALESCE({self._qident(delete_flag_column)}, {false_literal}) = {false_literal}"
+            )
+            row = cur.fetchone()
+            return (row[0], row[1]) if row else (None, None)
+        finally:
+            cur.close()
 
-        Each subsequent batch reads rows strictly greater than the last value of
-        the previous batch. OFFSET is never used — it scales linearly per batch
-        but quadratically across batches and is unstable under concurrent writes.
+    def extract_chunks(self, dataset, table, columns, plan, schema, start_watermark, start_primary_key, end_watermark, out_dir):
+        """SQL keyset pagination on watermark + primary key when present.
+
+        OFFSET is never used. Incremental loads use a composite cursor so rows
+        sharing the same watermark across batch boundaries are not skipped.
         """
         select_cols = ", ".join(self._qident(c) for c in columns)
-        sort_col = plan.watermark_column or (plan.pk_columns[0] if plan.pk_columns else columns[0])
+        pk_col = plan.pk_columns[0] if plan.pk_columns else None
+        sort_col = plan.watermark_column or pk_col or columns[0]
+        wm_spec = schema.get(plan.watermark_column) if plan.watermark_column else None
+        pk_spec = schema.get(pk_col) if pk_col else None
+        order_cols = [plan.watermark_column, pk_col] if plan.watermark_column and pk_col else [sort_col]
+        order_by = ", ".join(f"{self._qident(c)} ASC" for c in order_cols if c)
 
-        cursor: Any = start_watermark
+        cursor_wm: Any = start_watermark
+        cursor_pk: Any = start_primary_key
         end_wm = end_watermark
         batch = 0
         while True:
             preds: list[str] = []
             params: list[Any] = []
-            if cursor is not None:
+            if plan.watermark_column and pk_col and cursor_wm is not None and cursor_pk is not None:
+                cursor_wm = _coerce_cursor_value(wm_spec, cursor_wm)
+                cursor_pk = _coerce_cursor_value(pk_spec, cursor_pk)
+                preds.append(
+                    f"({self._qident(plan.watermark_column)} > %s OR "
+                    f"({self._qident(plan.watermark_column)} = %s AND {self._qident(pk_col)} > %s))"
+                )
+                params.extend([cursor_wm, cursor_wm, cursor_pk])
+            elif cursor_wm is not None:
                 preds.append(f"{self._qident(sort_col)} > %s")
-                params.append(cursor)
+                params.append(cursor_wm)
             if end_wm is not None and plan.watermark_column:
                 preds.append(f"{self._qident(plan.watermark_column)} <= %s")
                 params.append(end_wm)
             where = " WHERE " + " AND ".join(preds) if preds else ""
             sql = (
                 f"SELECT {select_cols} FROM {self._fqtn(dataset, table)}{where} "
-                f"ORDER BY {self._qident(sort_col)} ASC LIMIT {plan.batch_size}"
+                f"ORDER BY {order_by} LIMIT {plan.batch_size}"
             )
             try:
                 df = pd.read_sql_query(sql, self.conn, params=params)
@@ -472,8 +708,11 @@ class SqlSourceAdapter(SourceAdapter):
                 break
             path = out_dir / f"batch_{batch:05d}.parquet"
             df.to_parquet(path, index=False)
-            yield ChunkResult(str(path), len(df), path.stat().st_size, batch)
-            cursor = df[sort_col].iloc[-1]
+            last_wm = df[plan.watermark_column].iloc[-1] if plan.watermark_column else df[sort_col].iloc[-1]
+            last_pk = df[pk_col].iloc[-1] if pk_col else None
+            yield ChunkResult(str(path), len(df), path.stat().st_size, batch, last_wm, last_pk)
+            cursor_wm = last_wm
+            cursor_pk = last_pk
             if len(df) < plan.batch_size:
                 break
             batch += 1
@@ -500,76 +739,193 @@ def build_source_adapter(conn: Connection) -> SourceAdapter:
 class SnowflakeTargetAdapter:
     """Snowflake target with explicit-column COPY INTO and accurate MERGE counts."""
 
-    def __init__(self, conn: Connection, job: Job):
+    def __init__(self, conn: Connection, job: Job, run_id: str | None = None, user_id: str | None = None):
         import snowflake.connector
         cipher = get_cipher()
         credentials = cipher.decrypt_dict(conn.credentials) if conn.credentials else {}
         cfg = {**(conn.config or {}), **credentials}
         self.cfg = cfg
         self.job = job
+        self.run_id = run_id
+        self.task_id: str | None = None
+        self.table_name: str | None = None
+        self.phase = "unknown"
+        self._query_events: list[dict[str, Any]] = []
+        self._borrowed_session = False
+        self._session_lock = None
         try:
             account = cfg.get("account")
             user = cfg.get("user") or cfg.get("username")
             password = cfg.get("password")
             warehouse = job.sf_warehouse or cfg.get("warehouse")
             database = job.sf_database or cfg.get("database")
-            schema = job.sf_schema or cfg.get("schema")
+            schema = job.sf_schema or cfg.get("schema") or cfg.get("schema_name")
             role = job.sf_role or cfg.get("role") or None
+            auth_method = snowflake_auth_method(cfg)
+            secret_field = "private_key" if auth_method in {"key_pair", "private_key", "jwt"} else "password"
             missing = [k for k, v in {
-                "account": account, "user": user, "password": password,
+                "account": account,
+                "user": user,
+                secret_field: cfg.get(secret_field) if secret_field == "private_key" else password,
                 "warehouse": warehouse, "database": database, "schema": schema,
             }.items() if not v]
             if missing:
                 raise PermanentError(f"Missing Snowflake connection fields: {', '.join(missing)}")
+            if cfg.get("auth_method") == "password_mfa":
+                from services.snowflake_session_manager import SNOWFLAKE_MFA_EXPIRED_MESSAGE, snowflake_session_manager
+
+                if not user_id:
+                    raise PermanentError(SNOWFLAKE_MFA_EXPIRED_MESSAGE)
+                entry = snowflake_session_manager.get_active_session(user_id=str(user_id), connection_id=conn.id)
+                connector = entry.get("connector") if entry else None
+                live_conn = getattr(connector, "_conn", None)
+                if not entry or connector is None or live_conn is None:
+                    raise PermanentError(SNOWFLAKE_MFA_EXPIRED_MESSAGE)
+                self._session_lock = entry.get("lock")
+                if self._session_lock:
+                    self._session_lock.acquire()
+                self.conn = live_conn
+                self._borrowed_session = True
+                self._stage_tables_to_drop: list[str] = []
+                try:
+                    if role:
+                        self.execute_simple(f"USE ROLE {self.q(role)}", phase="setup")
+                    self.execute_simple(f"USE WAREHOUSE {self.q(warehouse)}", phase="setup")
+                    self.execute_simple(f"USE DATABASE {self.q(database)}", phase="setup")
+                    self.execute_simple(f"USE SCHEMA {self.q(schema)}", phase="setup")
+                except Exception:
+                    if self._session_lock:
+                        self._session_lock.release()
+                    raise
+                return
             ca_bundle = os.getenv("SNOWFLAKE_CA_BUNDLE") or os.getenv("REQUESTS_CA_BUNDLE")
             if ca_bundle:
                 os.environ["REQUESTS_CA_BUNDLE"] = ca_bundle
                 os.environ["SSL_CERT_FILE"] = ca_bundle
-            self.conn = snowflake.connector.connect(
-                account=account,
-                user=user,
-                password=password,
-                warehouse=warehouse,
-                database=database,
-                schema=schema,
-                role=role,
-                session_parameters={"QUERY_TAG": f"UMA_REAL_ENGINE_JOB_{job.id}"},
+            self.conn = snowflake.connector.connect(**snowflake_connect_kwargs(
+                {**cfg, "account": account, "user": user, "warehouse": warehouse, "database": database, "schema": schema, "role": role},
+                query_tag=self._query_tag(),
                 client_session_keep_alive=True,
                 login_timeout=30,
                 network_timeout=120,
-                insecure_mode=os.getenv("SNOWFLAKE_INSECURE_MODE", "false").lower() == "true",
-            )
+            ))
         except Exception as e:
             raise _classify(e) from e
         self._stage_tables_to_drop: list[str] = []
 
+    def set_context(
+        self,
+        *,
+        phase: str | None = None,
+        table_name: str | None = None,
+        task_id: str | None = None,
+    ) -> None:
+        if phase is not None:
+            self.phase = phase
+        if table_name is not None:
+            self.table_name = table_name
+        if task_id is not None:
+            self.task_id = task_id
+
+    def _query_tag(
+        self,
+        phase: str | None = None,
+        table_name: str | None = None,
+        task_id: str | None = None,
+    ) -> str:
+        tag = {
+            "app": "UMA",
+            "job_id": self.job.id,
+            "run_id": self.run_id,
+            "task_id": task_id if task_id is not None else self.task_id,
+            "table_name": table_name if table_name is not None else self.table_name,
+            "phase": phase or self.phase or "unknown",
+        }
+        return json.dumps({k: v for k, v in tag.items() if v is not None}, sort_keys=True)
+
+    @staticmethod
+    def _quote_literal(value: str) -> str:
+        return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
+
+    def pop_query_events(self) -> list[dict[str, Any]]:
+        events = list(self._query_events)
+        self._query_events.clear()
+        return events
+
     def close(self):
         for fqn in self._stage_tables_to_drop:
             try:
-                self.execute_simple(f"DROP TABLE IF EXISTS {fqn}")
+                self.execute_simple(f"DROP TABLE IF EXISTS {fqn}", phase="cleanup")
             except Exception as e:
                 logger.warning("Failed to drop stage table %s: %s", fqn, e)
-        try:
-            self.conn.close()
-        except Exception:
-            pass
+        if not self._borrowed_session:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        if self._session_lock:
+            try:
+                self._session_lock.release()
+            except Exception:
+                pass
 
     @_retry()
-    def execute(self, sql: str, params: Optional[tuple] = None):
+    def execute(
+        self,
+        sql: str,
+        params: Optional[tuple] = None,
+        *,
+        phase: str | None = None,
+        table_name: str | None = None,
+        task_id: str | None = None,
+    ):
         cur = self.conn.cursor()
+        tag = self._query_tag(phase=phase, table_name=table_name, task_id=task_id)
+        started = datetime.utcnow()
+        qid = None
         try:
+            cur.execute(f"ALTER SESSION SET QUERY_TAG = {self._quote_literal(tag)}")
             cur.execute(sql, params)
+            qid = cur.sfqid
             try:
-                return cur.fetchall(), cur.sfqid
+                rows = cur.fetchall()
             except Exception:
-                return [], cur.sfqid
+                rows = []
+            self._query_events.append({
+                "job_id": self.job.id,
+                "run_id": self.run_id,
+                "task_id": task_id if task_id is not None else self.task_id,
+                "table_name": table_name if table_name is not None else self.table_name,
+                "phase": phase or self.phase or "unknown",
+                "query_id": qid,
+                "query_tag": tag,
+                "warehouse_name": self.job.sf_warehouse or self.cfg.get("warehouse"),
+                "started_at": started,
+                "ended_at": datetime.utcnow(),
+                "status": "SUCCEEDED",
+            })
+            return rows, qid
         except Exception as e:
+            if qid:
+                self._query_events.append({
+                    "job_id": self.job.id,
+                    "run_id": self.run_id,
+                    "task_id": task_id if task_id is not None else self.task_id,
+                    "table_name": table_name if table_name is not None else self.table_name,
+                    "phase": phase or self.phase or "unknown",
+                    "query_id": qid,
+                    "query_tag": tag,
+                    "warehouse_name": self.job.sf_warehouse or self.cfg.get("warehouse"),
+                    "started_at": started,
+                    "ended_at": datetime.utcnow(),
+                    "status": "FAILED",
+                })
             raise _classify(e) from e
         finally:
             cur.close()
 
-    def execute_simple(self, sql: str, params: Optional[tuple] = None):
-        rows, _ = self.execute(sql, params)
+    def execute_simple(self, sql: str, params: Optional[tuple] = None, **context):
+        rows, _ = self.execute(sql, params, **context)
         return rows
 
     def q(self, name: str) -> str:
@@ -599,9 +955,10 @@ class SnowflakeTargetAdapter:
         return "VARCHAR"
 
     def ensure_database_schema(self):
-        self.execute_simple(f"CREATE DATABASE IF NOT EXISTS {self.q(self.job.sf_database)}")
+        self.execute_simple(f"CREATE DATABASE IF NOT EXISTS {self.q(self.job.sf_database)}", phase="ddl")
         self.execute_simple(
-            f"CREATE SCHEMA IF NOT EXISTS {self.q(self.job.sf_database)}.{self.q(self.job.sf_schema)}"
+            f"CREATE SCHEMA IF NOT EXISTS {self.q(self.job.sf_database)}.{self.q(self.job.sf_schema)}",
+            phase="ddl",
         )
 
     def _column_ddl(self, c: ColumnSpec) -> str:
@@ -617,12 +974,14 @@ class SnowflakeTargetAdapter:
         self.execute_simple(
             f"CREATE TABLE IF NOT EXISTS "
             f"{self.fqn(self.job.sf_database, self.job.sf_schema, table)} "
-            f"(" + ", ".join(cols) + ")"
+            f"(" + ", ".join(cols) + ")",
+            phase="ddl",
+            table_name=table,
         )
 
     def recreate_stage_table(self, stage_table: str, schema: TableSchema):
         fqn = self.fqn(self.job.sf_database, self.job.sf_schema, stage_table)
-        self.execute_simple(f"DROP TABLE IF EXISTS {fqn}")
+        self.execute_simple(f"DROP TABLE IF EXISTS {fqn}", phase="stage", table_name=stage_table)
         cols = [self._column_ddl(c) for c in schema.columns]
         cols.extend([
             "_UMA_BATCH_ID VARCHAR",
@@ -631,7 +990,11 @@ class SnowflakeTargetAdapter:
         ])
         # NB: deliberately not TEMP — engine can crash mid-run; we want the stage to outlive
         # a single connection so a retry/resume can re-use it. We drop it in close().
-        self.execute_simple(f"CREATE TABLE {fqn} (" + ", ".join(cols) + ")")
+        self.execute_simple(
+            f"CREATE TABLE {fqn} (" + ", ".join(cols) + ")",
+            phase="stage",
+            table_name=stage_table,
+        )
         self._stage_tables_to_drop.append(fqn)
 
     def put_and_copy(
@@ -651,7 +1014,9 @@ class SnowflakeTargetAdapter:
         for f in files:
             # OVERWRITE=TRUE so a retry of the same batch_id is idempotent.
             self.execute_simple(
-                f"PUT 'file://{f.file_path}' {stage_path} AUTO_COMPRESS=TRUE OVERWRITE=TRUE PARALLEL=4"
+                f"PUT 'file://{f.file_path}' {stage_path} AUTO_COMPRESS=TRUE OVERWRITE=TRUE PARALLEL=4",
+                phase="stage",
+                table_name=stage_table,
             )
         stage_fqn = self.fqn(self.job.sf_database, self.job.sf_schema, stage_table)
         col_select_parts: list[str] = []
@@ -678,20 +1043,22 @@ class SnowflakeTargetAdapter:
         ON_ERROR = 'ABORT_STATEMENT'
         PURGE = TRUE
         """
-        self.execute_simple(copy_sql)
-        rows, _ = self.execute(f"SELECT COUNT(*) FROM {stage_fqn}")
+        self.execute_simple(copy_sql, phase="copy", table_name=stage_table)
+        rows, _ = self.execute(f"SELECT COUNT(*) FROM {stage_fqn}", phase="copy", table_name=stage_table)
         return int(rows[0][0]) if rows else 0
 
     def apply_full_load(self, target_table: str, stage_table: str, columns: list[str]) -> dict[str, int]:
         target = self.fqn(self.job.sf_database, self.job.sf_schema, target_table)
         stage = self.fqn(self.job.sf_database, self.job.sf_schema, stage_table)
         quoted_cols = ", ".join(self.q(c) for c in columns)
-        self.execute_simple(f"TRUNCATE TABLE {target}")
+        self.execute_simple(f"TRUNCATE TABLE {target}", phase="merge", table_name=target_table)
         self.execute_simple(
             f"INSERT INTO {target} ({quoted_cols}, _UMA_BATCH_ID, _UMA_LOADED_AT, _UMA_IS_DELETED) "
-            f"SELECT {quoted_cols}, _UMA_BATCH_ID, _UMA_LOADED_AT, _UMA_IS_DELETED FROM {stage}"
+            f"SELECT {quoted_cols}, _UMA_BATCH_ID, _UMA_LOADED_AT, _UMA_IS_DELETED FROM {stage}",
+            phase="merge",
+            table_name=target_table,
         )
-        rows, _ = self.execute(f"SELECT COUNT(*) FROM {target}")
+        rows, _ = self.execute(f"SELECT COUNT(*) FROM {target}", phase="merge", table_name=target_table)
         inserted = int(rows[0][0]) if rows else 0
         return {"inserted": inserted, "updated": 0, "deleted": 0}
 
@@ -752,12 +1119,16 @@ class SnowflakeTargetAdapter:
         WHEN MATCHED THEN UPDATE SET {update_set}
         WHEN NOT MATCHED AND NOT s._UMA_IS_DELETED THEN INSERT ({insert_cols}) VALUES ({insert_vals})
         """
-        _, qid = self.execute(merge_sql)
+        _, qid = self.execute(merge_sql, phase="merge", table_name=target_table)
         # Snowflake MERGE returns per-action row counts in the result set —
         # columns: "number of rows inserted", "number of rows updated", "number of rows deleted".
         # We retrieve them via RESULT_SCAN of the MERGE query id.
         try:
-            scan_rows = self.execute_simple(f"SELECT * FROM TABLE(RESULT_SCAN('{qid}'))")
+            scan_rows = self.execute_simple(
+                f"SELECT * FROM TABLE(RESULT_SCAN('{qid}'))",
+                phase="merge",
+                table_name=target_table,
+            )
         except Exception:
             scan_rows = []
         inserted = updated = deleted_hard = 0
@@ -779,7 +1150,9 @@ class SnowflakeTargetAdapter:
         deleted_marked = 0
         if delete_flag:
             rows, _ = self.execute(
-                f"SELECT COUNT(*) FROM {stage} WHERE _UMA_IS_DELETED = TRUE"
+                f"SELECT COUNT(*) FROM {stage} WHERE _UMA_IS_DELETED = TRUE",
+                phase="merge",
+                table_name=target_table,
             )
             deleted_marked = int(rows[0][0]) if rows else 0
         return {
@@ -791,7 +1164,9 @@ class SnowflakeTargetAdapter:
     def target_row_count(self, table: str) -> int:
         rows, _ = self.execute(
             f"SELECT COUNT(*) FROM {self.fqn(self.job.sf_database, self.job.sf_schema, table)} "
-            f"WHERE COALESCE(_UMA_IS_DELETED, FALSE) = FALSE"
+            f"WHERE COALESCE(_UMA_IS_DELETED, FALSE) = FALSE",
+            phase="validate",
+            table_name=table,
         )
         return int(rows[0][0] or 0) if rows else 0
 
@@ -799,9 +1174,27 @@ class SnowflakeTargetAdapter:
         rows, _ = self.execute(
             f"SELECT MIN({self.q(column)}), MAX({self.q(column)}) "
             f"FROM {self.fqn(self.job.sf_database, self.job.sf_schema, table)} "
-            f"WHERE COALESCE(_UMA_IS_DELETED, FALSE) = FALSE"
+            f"WHERE COALESCE(_UMA_IS_DELETED, FALSE) = FALSE",
+            phase="validate",
+            table_name=table,
         )
         return (rows[0][0], rows[0][1]) if rows else (None, None)
+
+    def target_duplicate_primary_key_count(self, table: str, pk_columns: list[str]) -> int:
+        if not pk_columns:
+            return 0
+        target = self.fqn(self.job.sf_database, self.job.sf_schema, table)
+        cols = ", ".join(self.q(c) for c in pk_columns)
+        rows, _ = self.execute(
+            f"SELECT COUNT(*) FROM ("
+            f"SELECT {cols}, COUNT(*) AS c FROM {target} "
+            f"WHERE COALESCE(_UMA_IS_DELETED, FALSE) = FALSE "
+            f"GROUP BY {cols} HAVING COUNT(*) > 1"
+            f")",
+            phase="validate",
+            table_name=table,
+        )
+        return int(rows[0][0] or 0) if rows else 0
 
 
 # ─── Plan builder ───────────────────────────────────────────────────────────
@@ -829,10 +1222,13 @@ def task_plan(job: Job, task: JobTask) -> TablePlan:
 # ─── The engine ─────────────────────────────────────────────────────────────
 
 class RealMigrationEngine:
-    def __init__(self, job_id: str):
+    def __init__(self, job_id: str, lease_holder: str | None = None, user_id: str | None = None):
         self.job_id = job_id
         self.batch_id = f"uma_{job_id}_{int(time.time())}"
         self._cancelled = False
+        self.lease_holder = lease_holder
+        self.current_run_id: str | None = None
+        self.user_id = user_id
 
     async def _is_cancelled(self) -> bool:
         async with AsyncSessionLocal() as db:
@@ -843,21 +1239,30 @@ class RealMigrationEngine:
             return False
 
     async def execute(self) -> dict[str, Any]:
-        async with AsyncSessionLocal() as db:
-            job = (
-                await db.execute(
-                    select(Job).options(selectinload(Job.tasks)).where(Job.id == self.job_id)
-                )
-            ).scalar_one_or_none()
-            if not job:
-                raise ValueError(f"Job not found: {self.job_id}")
-            # Run-level dedupe: don't kick off a second concurrent run.
-            if job.status == JobStatus.running:
-                logger.warning("execute called while job %s is already running — refusing", job.id)
-                return {"success": False, "error": "Job already running"}
+        acquired_here = False
+        if not self.lease_holder:
+            from services.job_run_locks import acquire_job_run_lease
 
-            run = await self._create_run(db, job)
+            lease = await acquire_job_run_lease(self.job_id)
+            if not lease:
+                return {"success": False, "error": "Job is already running", "conflict": True}
+            self.lease_holder = lease.holder_id
+            acquired_here = True
+        async with AsyncSessionLocal() as db:
             try:
+                job = (
+                    await db.execute(
+                        select(Job).options(selectinload(Job.tasks)).where(Job.id == self.job_id)
+                    )
+                ).scalar_one_or_none()
+                if not job:
+                    raise ValueError(f"Job not found: {self.job_id}")
+
+                run = await self._create_run(db, job)
+                self.current_run_id = run.id
+                from services.job_run_locks import bind_job_run_lease
+
+                await bind_job_run_lease(job.id, self.lease_holder, run.id)
                 await self._mark_job(db, job, JobStatus.running, "REAL_ENGINE_RUNNING")
                 await self._log(
                     db,
@@ -892,13 +1297,20 @@ class RealMigrationEngine:
                 return {"success": True, "run_id": run.id, **result}
             except Exception as e:
                 logger.exception("Real migration failed")
-                run.status = "FAILED"
-                run.error_message = str(e)[:2000]
-                run.ended_at = datetime.utcnow()
-                await self._mark_job(db, job, JobStatus.failed, "FAILED")
-                await self._log(db, "REAL_ENGINE_FAILED", str(e)[:500], level=LogLevel.error)
+                if "run" in locals():
+                    run.status = "FAILED"
+                    run.error_message = str(e)[:2000]
+                    run.ended_at = datetime.utcnow()
+                if "job" in locals() and job:
+                    await self._mark_job(db, job, JobStatus.failed, "FAILED")
+                    await self._log(db, "REAL_ENGINE_FAILED", str(e)[:500], level=LogLevel.error)
                 await db.commit()
-                return {"success": False, "run_id": run.id, "error": str(e)}
+                return {"success": False, "run_id": run.id if "run" in locals() else None, "error": str(e)}
+            finally:
+                if acquired_here:
+                    from services.job_run_locks import release_job_run_lease
+
+                    await release_job_run_lease(self.job_id, self.lease_holder)
 
     async def _execute_sync(self, db: AsyncSession, job: Job, run: MigrationRun) -> dict[str, int]:
         src_conn = await db.get(Connection, job.source_connection_id)
@@ -918,9 +1330,11 @@ class RealMigrationEngine:
             "bytes_staged": 0,
         }
         source = build_source_adapter(src_conn)
-        target = SnowflakeTargetAdapter(dst_conn, job)
-        target.ensure_database_schema()
+        target = None
         try:
+            await self._create_cost_records(db, job, run, source)
+            target = SnowflakeTargetAdapter(dst_conn, job, run.id, user_id=self.user_id)
+            target.ensure_database_schema()
             for task in list(job.tasks):
                 if await self._is_cancelled():
                     await self._log(
@@ -933,19 +1347,26 @@ class RealMigrationEngine:
                     totals[k] += table_result.get(k, 0)
             return totals
         finally:
+            if target is not None:
+                try:
+                    await self._flush_snowflake_queries(db, target)
+                except Exception:
+                    logger.warning("Failed to persist Snowflake query events", exc_info=True)
             try:
                 source.close()
             except Exception:
                 logger.warning("source.close() failed", exc_info=True)
-            try:
-                target.close()
-            except Exception:
-                logger.warning("target.close() failed", exc_info=True)
+            if target is not None:
+                try:
+                    target.close()
+                except Exception:
+                    logger.warning("target.close() failed", exc_info=True)
 
     async def _run_table(self, db, job, run, task, source, target) -> dict[str, int]:
         table_key = f"{task.source_dataset}.{task.source_table}"
         plan = task_plan(job, task)
         state = await self._get_state(db, job, task, table_key, plan)
+        last_primary_key = _state_last_primary_key(state)
         tr = MigrationTaskRun(
             run_id=run.id,
             job_id=job.id,
@@ -961,6 +1382,7 @@ class RealMigrationEngine:
         task.started_at = datetime.utcnow()
         await db.commit()
         await self._log(db, "TABLE_STARTED", f"Starting real movement for {table_key}", task_ref=table_key)
+        target.set_context(phase="planning", table_name=task.target_table, task_id=task.id)
 
         out_dir = Path(os.getenv("UMA_LOCAL_STAGE_DIR", "/tmp/uma_staging")) / run.id / task.id
         if out_dir.exists():
@@ -980,6 +1402,12 @@ class RealMigrationEngine:
                 raise PermanentError(
                     f"watermark_column '{plan.watermark_column}' is not present in source schema"
                 )
+            if plan.watermark_column and plan.pk_columns:
+                pk = plan.pk_columns[0]
+                if not schema.get(pk):
+                    raise PermanentError(
+                        f"primary_key_column '{pk}' is not present in source table schema"
+                    )
 
             end_wm = None
             if not plan.full_refresh and plan.watermark_column:
@@ -988,6 +1416,8 @@ class RealMigrationEngine:
                     task.source_table,
                     plan.watermark_column,
                     state.last_watermark_value,
+                    plan.pk_columns[0] if plan.pk_columns else None,
+                    last_primary_key,
                 )
                 if end_wm is None:
                     await self._complete_empty_table(db, task, tr, state)
@@ -1006,6 +1436,7 @@ class RealMigrationEngine:
                     plan,
                     schema,
                     state.last_watermark_value,
+                    last_primary_key,
                     end_wm,
                     out_dir,
                 )
@@ -1016,15 +1447,24 @@ class RealMigrationEngine:
                 await self._complete_empty_table(db, task, tr, state)
                 return self._zero_table_result()
 
+            target.set_context(phase="ddl", table_name=task.target_table, task_id=task.id)
             target.ensure_table(task.target_table, schema)
             stage_table = (
                 f"_UMA_STAGE_{task.target_table}_{run.id[:8]}".replace("-", "_").upper()
             )
+            await self._record_chunk_manifest(
+                db, job, run, task, table_key, chunks, state.last_watermark_value, stage_table
+            )
+            target.set_context(phase="stage", table_name=task.target_table, task_id=task.id)
             target.recreate_stage_table(stage_table, schema)
+            await self._mark_chunk_manifest(db, run.id, task.id, "uploaded")
+            target.set_context(phase="copy", table_name=task.target_table, task_id=task.id)
             rows_loaded = target.put_and_copy(
                 chunks, stage_table, schema, self.batch_id, plan.delete_flag_column
             )
+            await self._mark_chunk_manifest(db, run.id, task.id, "copied")
 
+            target.set_context(phase="merge", table_name=task.target_table, task_id=task.id)
             if plan.full_refresh:
                 merge_result = target.apply_full_load(task.target_table, stage_table, columns)
             else:
@@ -1035,15 +1475,19 @@ class RealMigrationEngine:
             updated = merge_result.get("updated", 0)
             deleted = merge_result.get("deleted", 0)
             rows_merged = inserted + updated
+            await self._mark_chunk_manifest(db, run.id, task.id, "merged")
 
+            target.set_context(phase="validate", table_name=task.target_table, task_id=task.id)
             validation = await self._validate_table_counts(
-                db, job, task, source, target, schema, table_key
+                db, job, run, task, source, target, schema, table_key
             )
             if not validation["passed"]:
                 raise PermanentError(validation["message"])
+            await self._mark_chunk_manifest(db, run.id, task.id, "validated")
 
             if end_wm is not None:
                 state.last_watermark_value = str(end_wm)
+                _set_state_last_primary_key(state, chunks[-1].last_primary_key)
             elif plan.full_refresh and plan.watermark_column:
                 max_wm = source.max_watermark(
                     task.source_dataset, task.source_table, plan.watermark_column, None
@@ -1051,6 +1495,8 @@ class RealMigrationEngine:
                 state.last_watermark_value = (
                     str(max_wm) if max_wm is not None else state.last_watermark_value
                 )
+                if chunks and plan.pk_columns:
+                    _set_state_last_primary_key(state, chunks[-1].last_primary_key)
             state.last_successful_run_id = run.id
             state.last_success_at = datetime.utcnow()
             state.strategy = job.load_strategy.value
@@ -1072,6 +1518,7 @@ class RealMigrationEngine:
             task.bytes_exported = bytes_staged
             task.files_exported = len(chunks)
             task.ended_at = datetime.utcnow()
+            await self._flush_snowflake_queries(db, target)
             await db.commit()
             await self._log(
                 db,
@@ -1098,6 +1545,8 @@ class RealMigrationEngine:
             task.status = TaskStatus.failed
             task.error_message = str(classified)[:2000]
             task.ended_at = datetime.utcnow()
+            await self._mark_chunk_manifest(db, run.id, task.id, "failed", str(classified)[:2000])
+            await self._flush_snowflake_queries(db, target)
             await db.commit()
             await self._log(
                 db, "TABLE_FAILED", str(classified)[:500], level=LogLevel.error, task_ref=table_key
@@ -1119,12 +1568,171 @@ class RealMigrationEngine:
             "bytes_staged": 0,
         }
 
+    @staticmethod
+    def _warehouse_credit_factor(warehouse: str | None) -> float:
+        size = (warehouse or "").lower()
+        if "6x" in size:
+            return 512.0
+        if "5x" in size:
+            return 256.0
+        if "4x" in size:
+            return 128.0
+        if "3x" in size:
+            return 64.0
+        if "2x" in size:
+            return 32.0
+        if "xlarge" in size or "x-large" in size:
+            return 16.0
+        if "large" in size:
+            return 8.0
+        if "medium" in size:
+            return 4.0
+        if "small" in size:
+            return 2.0
+        return 1.0
+
+    @classmethod
+    def estimate_table_cost(
+        cls,
+        *,
+        estimated_rows: int,
+        estimated_source_bytes: int,
+        load_strategy: str,
+        warehouse: str,
+        validation_strategy: str = "row_count",
+        credit_rate: float = 0.0,
+    ) -> dict[str, Any]:
+        strategy = (load_strategy or "full_load").lower()
+        safety = 1.5 if strategy in {"incremental", "upsert", "cdc"} else 1.2
+        if validation_strategy and validation_strategy != "none":
+            safety += 0.2
+        compressed = int(max(0, estimated_source_bytes) * 0.35)
+        runtime_seconds = max(10.0, estimated_rows / 5000.0)
+        warehouse_factor = cls._warehouse_credit_factor(warehouse)
+        credits = max(0.01, runtime_seconds / 3600.0 * warehouse_factor * safety)
+        confidence = "medium" if estimated_rows and estimated_source_bytes else "low"
+        return {
+            "estimated_compressed_bytes": compressed,
+            "estimated_runtime_seconds": runtime_seconds,
+            "estimated_credits": credits,
+            "estimated_cost": credits * credit_rate if credit_rate else 0.0,
+            "confidence_level": confidence,
+            "assumptions": {
+                "safety_factor": safety,
+                "warehouse_factor": warehouse_factor,
+                "validation_strategy": validation_strategy,
+                "credit_rate": credit_rate,
+            },
+        }
+
+    async def _create_cost_records(self, db, job, run, source) -> None:
+        total_estimated_cost = 0.0
+        rate = float(os.getenv("SNOWFLAKE_CREDIT_COST_USD", "0") or 0)
+        for task in list(job.tasks):
+            cfg = task.config or {}
+            try:
+                rows = int(source.row_count(task.source_dataset, task.source_table))
+            except Exception:
+                rows = 0
+            row_width = int(cfg.get("estimated_row_width_bytes") or 256)
+            source_bytes = int(cfg.get("estimated_source_bytes") or rows * row_width)
+            estimate = self.estimate_table_cost(
+                estimated_rows=rows,
+                estimated_source_bytes=source_bytes,
+                load_strategy=job.load_strategy.value,
+                warehouse=job.sf_warehouse,
+                validation_strategy=cfg.get("validation_strategy") or "row_count",
+                credit_rate=rate,
+            )
+            total_estimated_cost += estimate["estimated_cost"]
+            db.add(MigrationCostEstimate(
+                job_id=job.id,
+                run_id=run.id,
+                table_name=f"{task.source_dataset}.{task.source_table}",
+                estimated_rows=rows,
+                estimated_source_bytes=source_bytes,
+                estimated_compressed_bytes=estimate["estimated_compressed_bytes"],
+                estimated_runtime_seconds=estimate["estimated_runtime_seconds"],
+                estimated_credits=estimate["estimated_credits"],
+                estimated_cost=estimate["estimated_cost"],
+                currency="USD",
+                confidence_level=estimate["confidence_level"],
+                assumptions=estimate["assumptions"],
+            ))
+        db.add(MigrationCostActual(
+            job_id=job.id,
+            run_id=run.id,
+            total_estimated_cost=total_estimated_cost,
+            status="pending",
+        ))
+        await db.commit()
+
+    async def _flush_snowflake_queries(self, db, target) -> None:
+        for event in target.pop_query_events():
+            if not event.get("query_id"):
+                continue
+            db.add(MigrationSnowflakeQuery(**event))
+        await db.commit()
+
     async def _complete_empty_table(self, db, task, tr, state):
         tr.status = "SUCCEEDED"
         tr.ended_at = datetime.utcnow()
         task.status = TaskStatus.succeeded
         task.ended_at = datetime.utcnow()
         state.last_success_at = datetime.utcnow()
+        await db.commit()
+
+    async def _record_chunk_manifest(
+        self,
+        db,
+        job,
+        run,
+        task,
+        table_key: str,
+        chunks: list[ChunkResult],
+        start_watermark: Any,
+        stage_table: str,
+    ) -> None:
+        for idx, chunk in enumerate(chunks):
+            db.add(MigrationChunkManifest(
+                run_id=run.id,
+                job_id=job.id,
+                task_id=task.id,
+                table_key=table_key,
+                chunk_index=idx,
+                state="extracted",
+                file_path=str(chunk.file_path),
+                stage_table=stage_table,
+                row_count=chunk.rows,
+                bytes_staged=chunk.bytes,
+                watermark_start=str(start_watermark) if start_watermark is not None else None,
+                watermark_end=str(chunk.last_watermark) if chunk.last_watermark is not None else None,
+                primary_key_end=_serialize_cursor_value(chunk.last_primary_key),
+            ))
+        await db.commit()
+
+    async def _mark_chunk_manifest(
+        self,
+        db,
+        run_id: str,
+        task_id: str,
+        state: str,
+        error_message: str | None = None,
+    ) -> None:
+        chunks = (
+            await db.execute(
+                select(MigrationChunkManifest).where(
+                    MigrationChunkManifest.run_id == run_id,
+                    MigrationChunkManifest.task_id == task_id,
+                )
+            )
+        ).scalars().all()
+        now = datetime.utcnow()
+        for chunk in chunks:
+            chunk.state = state
+            chunk.updated_at = now
+            if error_message:
+                chunk.error_message = error_message
         await db.commit()
 
     async def _get_state(self, db, job, task, table_key, plan) -> MigrationState:
@@ -1148,8 +1756,13 @@ class RealMigrationEngine:
             await db.commit()
         return state
 
-    async def _validate_table_counts(self, db, job, task, source, target, schema, table_key) -> dict[str, Any]:
-        source_count = source.row_count(task.source_dataset, task.source_table)
+    async def _validate_table_counts(self, db, job, run, task, source, target, schema, table_key) -> dict[str, Any]:
+        plan = task_plan(job, task)
+        source_count = source.active_row_count(
+            task.source_dataset,
+            task.source_table,
+            plan.delete_flag_column if schema.get(plan.delete_flag_column or "") else None,
+        )
         target_count = target.target_row_count(task.target_table)
         passed = int(source_count) == int(target_count)
         delta = int(target_count) - int(source_count)
@@ -1169,13 +1782,60 @@ class RealMigrationEngine:
             last_run=datetime.utcnow(),
             error_message="" if passed else "Source and Snowflake row counts differ",
         ))
-        if schema.get("updated_at"):
-            src_min, src_max = source.min_max(task.source_dataset, task.source_table, "updated_at")
-            tgt_min, tgt_max = target.target_min_max(task.target_table, "updated_at")
+        db.add(MigrationValidationResult(
+            run_id=run.id,
+            job_id=job.id,
+            task_id=task.id,
+            table_key=table_key,
+            rule_type="row_count",
+            severity="error",
+            status="PASS" if passed else "FAIL",
+            source_value=str(source_count),
+            target_value=str(target_count),
+            delta=f"{delta:+,}",
+            message="Source and Snowflake row counts match" if passed else "Source and Snowflake row counts differ",
+            result_json={"source_count": int(source_count), "target_count": int(target_count)},
+        ))
+        if plan.pk_columns:
+            duplicate_count = target.target_duplicate_primary_key_count(task.target_table, plan.pk_columns)
+            duplicate_passed = duplicate_count == 0
+            db.add(MigrationValidationResult(
+                run_id=run.id,
+                job_id=job.id,
+                task_id=task.id,
+                table_key=table_key,
+                rule_type="duplicate_primary_key",
+                severity="error",
+                status="PASS" if duplicate_passed else "FAIL",
+                source_value="0",
+                target_value=str(duplicate_count),
+                delta=str(duplicate_count),
+                message=(
+                    "No duplicate primary keys found"
+                    if duplicate_passed else
+                    "Duplicate primary keys found in Snowflake target"
+                ),
+                result_json={
+                    "primary_key_columns": plan.pk_columns,
+                    "duplicate_primary_key_count": duplicate_count,
+                },
+            ))
+            passed = passed and duplicate_passed
+        if plan.watermark_column and schema.get(plan.watermark_column):
+            active_delete_column = (
+                plan.delete_flag_column if schema.get(plan.delete_flag_column or "") else None
+            )
+            src_min, src_max = source.active_min_max(
+                task.source_dataset,
+                task.source_table,
+                plan.watermark_column,
+                active_delete_column,
+            )
+            tgt_min, tgt_max = target.target_min_max(task.target_table, plan.watermark_column)
             minmax_passed = str(src_min) == str(tgt_min) and str(src_max) == str(tgt_max)
             db.add(ValidationRule(
-                name=f"auto_minmax_updated_at_{task.target_table}",
-                rule_type="minmax_updated_at",
+                name=f"auto_minmax_{plan.watermark_column}_{task.target_table}",
+                rule_type="minmax_watermark",
                 target_table=f"{job.sf_database}.{job.sf_schema}.{task.target_table}",
                 job_id=job.id,
                 source_connection_id=job.source_connection_id,
@@ -1187,7 +1847,31 @@ class RealMigrationEngine:
                 target_value=f"{tgt_min} → {tgt_max}",
                 delta="matched" if minmax_passed else "mismatch",
                 last_run=datetime.utcnow(),
-                error_message="" if minmax_passed else "updated_at min/max differs",
+                error_message="" if minmax_passed else f"{plan.watermark_column} min/max differs",
+            ))
+            db.add(MigrationValidationResult(
+                run_id=run.id,
+                job_id=job.id,
+                task_id=task.id,
+                table_key=table_key,
+                rule_type="minmax_watermark",
+                severity="warning",
+                status="PASS" if minmax_passed else "FAIL",
+                source_value=f"{src_min} → {src_max}",
+                target_value=f"{tgt_min} → {tgt_max}",
+                delta="matched" if minmax_passed else "mismatch",
+                message=(
+                    f"{plan.watermark_column} min/max matches"
+                    if minmax_passed else
+                    f"{plan.watermark_column} min/max differs"
+                ),
+                result_json={
+                    "source_min": str(src_min),
+                    "source_max": str(src_max),
+                    "target_min": str(tgt_min),
+                    "target_max": str(tgt_max),
+                    "watermark_column": plan.watermark_column,
+                },
             ))
             passed = passed and minmax_passed
         await db.commit()
@@ -1246,6 +1930,19 @@ class RealMigrationEngine:
                 event=event,
                 message=msg,
                 detail=detail,
+            )
+        )
+        db.add(
+            MigrationRunEvent(
+                run_id=self.current_run_id,
+                job_id=self.job_id,
+                table_key=task_ref,
+                phase=event.lower().split("_", 1)[0],
+                event=event,
+                level=level.value if hasattr(level, "value") else str(level),
+                message=msg,
+                error_category="migration_error" if level == LogLevel.error else None,
+                event_json={"detail": detail} if detail else {},
             )
         )
         await db.commit()

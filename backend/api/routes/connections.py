@@ -20,37 +20,139 @@ from core.audit import record as audit_record, AuditAction, extract_request_cont
 from core.database import get_db
 from core.security import get_cipher, mask_secret
 from models import Connection, ConnectionRole, ConnectionType, User
+from services.snowflake_connection import normalize_snowflake_config, snowflake_execution_readiness
 
 router = APIRouter()
 logger = logging.getLogger("uma.routes.connections")
 _pool = ThreadPoolExecutor(max_workers=4)
+EPHEMERAL_CREDENTIAL_FIELDS = {"mfa_passcode", "passcode", "totp", "totp_passcode"}
+
+def _capabilities(
+    *,
+    connection_test: bool,
+    metadata_discovery: bool,
+    full_load: bool,
+    incremental_sync: bool,
+    cdc: bool,
+    sql_conversion: bool,
+    validation: bool,
+) -> dict[str, bool]:
+    return {
+        "connection_test": connection_test,
+        "metadata_discovery": metadata_discovery,
+        "full_load": full_load,
+        "incremental_sync": incremental_sync,
+        "cdc": cdc,
+        "sql_conversion": sql_conversion,
+        "validation": validation,
+    }
+
 
 CONNECTOR_REGISTRY = [
-    {"key": "bigquery", "display_name": "BigQuery", "status": "ready", "source": True, "target": False},
-    {"key": "redshift", "display_name": "Redshift", "status": "ready", "source": True, "target": False},
-    {"key": "snowflake", "display_name": "Snowflake", "status": "ready", "source": True, "target": True},
-    {"key": "sqlserver", "display_name": "SQL Server", "status": "ready", "source": True, "target": False},
-    {"key": "postgres", "display_name": "PostgreSQL", "status": "ready", "source": True, "target": False},
-    {"key": "mysql", "display_name": "MySQL", "status": "ready", "source": True, "target": False},
-    {"key": "oracle", "display_name": "Oracle", "status": "ready", "source": True, "target": False},
-    {"key": "teradata", "display_name": "Teradata", "status": "ready", "source": True, "target": False},
-    {"key": "synapse", "display_name": "Synapse", "status": "ready", "source": True, "target": False},
-    {"key": "salesforce", "display_name": "Salesforce", "status": "ready", "source": True, "target": False},
-    {"key": "zendesk", "display_name": "Zendesk", "status": "ready", "source": True, "target": False},
-    {"key": "hubspot", "display_name": "HubSpot", "status": "ready", "source": True, "target": False},
-    {"key": "stripe", "display_name": "Stripe", "status": "ready", "source": True, "target": False},
-    {"key": "jira", "display_name": "Jira", "status": "ready", "source": True, "target": False},
-    {"key": "s3", "display_name": "Amazon S3", "status": "ready", "source": True, "target": True},
-    {"key": "adls", "display_name": "ADLS Gen2", "status": "ready", "source": True, "target": True},
-    {"key": "gcs", "display_name": "GCS", "status": "ready", "source": True, "target": True},
-    {"key": "sftp", "display_name": "SFTP", "status": "ready", "source": True, "target": False},
-    {"key": "flatfile", "display_name": "Flat Files", "status": "ready", "source": True, "target": False},
-    {"key": "kafka", "display_name": "Kafka", "status": "ready", "source": True, "target": False},
-    {"key": "kinesis", "display_name": "Kinesis", "status": "ready", "source": True, "target": False},
-    {"key": "rest", "display_name": "REST/GraphQL", "status": "ready", "source": True, "target": False},
-    {"key": "netsuite", "display_name": "NetSuite", "status": "coming_soon", "source": True, "target": False},
-    {"key": "workday", "display_name": "Workday", "status": "coming_soon", "source": True, "target": False},
-    {"key": "ga4", "display_name": "Google Analytics", "status": "coming_soon", "source": True, "target": False},
+    {
+        "key": "postgres",
+        "display_name": "PostgreSQL",
+        "status": "GOLDEN_PATH",
+        "source": True,
+        "target": False,
+        "capabilities": _capabilities(connection_test=True, metadata_discovery=True, full_load=True, incremental_sync=True, cdc=False, sql_conversion=True, validation=True),
+        "known_limitations": ["CDC is cursor/incremental only unless log-based CDC is configured externally.", "Full-load cutover remains validation-gated."],
+    },
+    {
+        "key": "snowflake",
+        "display_name": "Snowflake",
+        "status": "GOLDEN_PATH",
+        "source": True,
+        "target": True,
+        "capabilities": _capabilities(connection_test=True, metadata_discovery=True, full_load=True, incremental_sync=True, cdc=False, sql_conversion=False, validation=True),
+        "known_limitations": ["Target execution is guarded by role, safety mode, and workspace confirmation.", "True CDC is not claimed for Snowflake targets."],
+    },
+    {
+        "key": "mysql",
+        "display_name": "MySQL",
+        "status": "BETA",
+        "source": True,
+        "target": False,
+        "capabilities": _capabilities(connection_test=True, metadata_discovery=True, full_load=True, incremental_sync=True, cdc=False, sql_conversion=True, validation=True),
+        "known_limitations": ["Incremental sync depends on a stable watermark or primary key.", "No log-based CDC in this local prototype."],
+    },
+    {
+        "key": "redshift",
+        "display_name": "Redshift",
+        "status": "BETA",
+        "source": True,
+        "target": False,
+        "capabilities": _capabilities(connection_test=True, metadata_discovery=True, full_load=True, incremental_sync=True, cdc=False, sql_conversion=True, validation=True),
+        "known_limitations": ["Distribution and sort-key tuning requires review.", "CDC is not implemented."],
+    },
+    {
+        "key": "bigquery",
+        "display_name": "BigQuery",
+        "status": "PREVIEW",
+        "source": True,
+        "target": False,
+        "capabilities": _capabilities(connection_test=True, metadata_discovery=True, full_load=True, incremental_sync=False, cdc=False, sql_conversion=True, validation=True),
+        "known_limitations": ["Nested/repeated fields require VARIANT or flattening review.", "Incremental sync is not proven end to end."],
+    },
+    *[
+        {
+            "key": key,
+            "display_name": display,
+            "status": "PREVIEW",
+            "source": True,
+            "target": False,
+            "capabilities": _capabilities(connection_test=True, metadata_discovery=True, full_load=False, incremental_sync=False, cdc=False, sql_conversion=True, validation=False),
+            "known_limitations": ["Migration execution is not yet proven end to end for this connector.", "Use for discovery and conversion analysis only."],
+        }
+        for key, display in [
+            ("sqlserver", "SQL Server"),
+            ("oracle", "Oracle"),
+            ("teradata", "Teradata"),
+            ("synapse", "Synapse"),
+        ]
+    ],
+    *[
+        {
+            "key": key,
+            "display_name": display,
+            "status": "CONNECTOR_ONLY",
+            "source": True,
+            "target": target,
+            "capabilities": _capabilities(connection_test=True, metadata_discovery=True, full_load=False, incremental_sync=False, cdc=False, sql_conversion=False, validation=False),
+            "known_limitations": ["Connector is available for connectivity or file/object discovery.", "No production-grade migration execution path is claimed."],
+        }
+        for key, display, target in [
+            ("salesforce", "Salesforce", False),
+            ("zendesk", "Zendesk", False),
+            ("hubspot", "HubSpot", False),
+            ("stripe", "Stripe", False),
+            ("jira", "Jira", False),
+            ("s3", "Amazon S3", True),
+            ("adls", "ADLS Gen2", True),
+            ("gcs", "GCS", True),
+            ("sftp", "SFTP", False),
+            ("flatfile", "Flat Files", False),
+            ("kafka", "Kafka", False),
+            ("kinesis", "Kinesis", False),
+            ("rest", "REST/GraphQL", False),
+        ]
+    ],
+    *[
+        {
+            "key": key,
+            "display_name": display,
+            "status": "COMING_SOON",
+            "source": True,
+            "target": False,
+            "capabilities": _capabilities(connection_test=False, metadata_discovery=False, full_load=False, incremental_sync=False, cdc=False, sql_conversion=False, validation=False),
+            "known_limitations": ["Not implemented in the local pilot build."],
+        }
+        for key, display in [
+            ("netsuite", "NetSuite"),
+            ("workday", "Workday"),
+            ("ga4", "Google Analytics"),
+        ]
+    ],
 ]
 
 
@@ -61,6 +163,8 @@ class ConnectionCreate(BaseModel):
     description: Optional[str] = ""
     credentials: Dict[str, Any] = {}
     config: Dict[str, Any] = {}
+    auth_method: Optional[str] = None
+    mfa_passcode: Optional[str] = None
 
     @field_validator("name")
     @classmethod
@@ -95,12 +199,64 @@ class ConnectionUpdate(BaseModel):
     description: Optional[str] = None
     credentials: Optional[Dict[str, Any]] = None
     config:      Optional[Dict[str, Any]] = None
+    auth_method: Optional[str] = None
+    mfa_passcode: Optional[str] = None
+
+
+class ConnectionTestRequest(BaseModel):
+    auth_method: Optional[str] = None
+    mfa_passcode: Optional[str] = None
+
+
+def _strip_ephemeral_credentials(values: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not values:
+        return {}
+    return {k: v for k, v in values.items() if k not in EPHEMERAL_CREDENTIAL_FIELDS}
+
+
+def _mfa_required_error(err: str) -> bool:
+    lowered = (err or "").lower()
+    return "mfa with totp is required" in lowered or ("mfa" in lowered and "totp" in lowered and "required" in lowered)
+
+
+def _mfa_required_message() -> str:
+    return "Snowflake requires MFA/TOTP. Enter a current MFA code and rerun the diagnostic."
 
 
 def _safe_conn(conn: Connection) -> dict:
     """Never return raw credentials. Show masked hints only."""
     cipher = get_cipher()
     credentials = cipher.decrypt_dict(conn.credentials) if conn.credentials else {}
+    cfg = conn.config or {}
+    if conn.type == ConnectionType.snowflake:
+        cfg = normalize_snowflake_config(cfg)
+        credentials = normalize_snowflake_config(credentials)
+    username = credentials.get("user") or credentials.get("username") or cfg.get("user") or cfg.get("username") or ""
+    database = cfg.get("database") or cfg.get("dbname") or ""
+    schema = cfg.get("schema") or cfg.get("schema_name") or ""
+    host = cfg.get("host") or cfg.get("hostname") or ""
+    port = cfg.get("port") or ""
+    safe_details = {
+        "connection_name": conn.name,
+        "type": conn.type.value,
+        "host": host,
+        "port": port,
+        "database": database,
+        "schema": schema,
+        "username": username,
+        "password_hidden": bool(credentials.get("password")),
+        "private_key_hidden": bool(credentials.get("private_key") or credentials.get("private_key_pem")),
+        "auth_method": cfg.get("auth_method") or ("key_pair" if credentials.get("private_key") or credentials.get("private_key_pem") else "password"),
+        "docker_service": cfg.get("docker_service", ""),
+        "docker_container": cfg.get("docker_container", ""),
+        "number_of_tables": cfg.get("table_count"),
+        "estimated_size": cfg.get("estimated_size") or cfg.get("estimated_size_gb"),
+        "health_status": conn.health,
+        "safe_copy_command": (
+            f"psql -h {host} -p {port} -U <username> -d {database}"
+            if conn.type == ConnectionType.postgres and database and host and port else ""
+        ),
+    }
 
     # Build a masked preview of credentials (e.g. "user: ab*****", "password: ****")
     credentials_masked = {}
@@ -121,6 +277,12 @@ def _safe_conn(conn: Connection) -> dict:
         "description":     conn.description,
         "config":          conn.config,
         "credentials":     credentials_masked,
+        "safe_details":    safe_details,
+        "execution_readiness": (
+            snowflake_execution_readiness({**cfg, **credentials})
+            if conn.type == ConnectionType.snowflake
+            else None
+        ),
         "health":          conn.health,
         "last_tested":     conn.last_tested.isoformat() if conn.last_tested else None,
         "created_at":      conn.created_at.isoformat(),
@@ -161,6 +323,9 @@ async def get_registry_status(
             "connector_key": item["key"],
             "display_name": item["display_name"],
             "status": item["status"],
+            "maturity": item["status"],
+            "capabilities": item.get("capabilities", {}),
+            "known_limitations": item.get("known_limitations", []),
             "configured_count": counts[item["key"]]["configured_count"],
             "source_count": counts[item["key"]]["source_count"],
             "target_count": counts[item["key"]]["target_count"],
@@ -190,7 +355,14 @@ async def create_connection(
     db: AsyncSession = Depends(get_db),
 ):
     cipher = get_cipher()
-    encrypted = cipher.encrypt_dict(body.credentials)
+    credentials = _strip_ephemeral_credentials(body.credentials)
+    config = _strip_ephemeral_credentials(body.config)
+    if body.auth_method:
+        config["auth_method"] = body.auth_method
+    if body.type == ConnectionType.snowflake.value:
+        credentials = normalize_snowflake_config(credentials)
+        config = normalize_snowflake_config(config)
+    encrypted = cipher.encrypt_dict(credentials)
 
     conn = Connection(
         name=body.name,
@@ -198,7 +370,7 @@ async def create_connection(
         connection_role=ConnectionRole(body.connection_role),
         description=body.description or "",
         credentials=encrypted,
-        config=body.config,
+        config=config,
         health="unknown",
         created_by_id=user.id,
     )
@@ -244,10 +416,18 @@ async def update_connection(
     if body.description is not None:
         conn.description = body.description; changes.append("description")
     if body.config is not None:
-        conn.config = body.config; changes.append("config")
+        config = _strip_ephemeral_credentials(body.config)
+        if body.auth_method:
+            config["auth_method"] = body.auth_method
+        if conn.type == ConnectionType.snowflake:
+            config = normalize_snowflake_config(config)
+        conn.config = config; changes.append("config")
     if body.credentials is not None:
         # Re-encrypt the full set
-        conn.credentials = cipher.encrypt_dict(body.credentials)
+        credentials = _strip_ephemeral_credentials(body.credentials)
+        if conn.type == ConnectionType.snowflake:
+            credentials = normalize_snowflake_config(credentials)
+        conn.credentials = cipher.encrypt_dict(credentials)
         changes.append("credentials")
 
     conn.updated_at = datetime.utcnow()
@@ -309,7 +489,28 @@ async def test_credentials(
         return {"success": False, "error": f"Unknown connection type: {body.type}",
                 "duration_ms": 0}
 
-    cfg = {**body.config, **body.credentials}
+    cfg = {
+        **_strip_ephemeral_credentials(body.config),
+        **_strip_ephemeral_credentials(body.credentials),
+    }
+    if body.auth_method:
+        cfg["auth_method"] = body.auth_method
+    if body.mfa_passcode:
+        cfg["mfa_passcode"] = body.mfa_passcode
+    if conn_type == ConnectionType.snowflake:
+        cfg = normalize_snowflake_config(cfg)
+
+    if (
+        conn_type == ConnectionType.snowflake
+        and cfg.get("auth_method") == "password_mfa"
+        and not cfg.get("mfa_passcode")
+    ):
+        return {
+            "success": False,
+            "error": "Missing MFA/TOTP passcode for Snowflake Password + MFA test.",
+            "diagnostic": _mfa_required_message(),
+            "duration_ms": int((time.time() - start) * 1000),
+        }
 
     try:
         result = await asyncio.get_event_loop().run_in_executor(
@@ -324,10 +525,14 @@ async def test_credentials(
         }
 
     result["duration_ms"] = int((time.time() - start) * 1000)
+    if conn_type == ConnectionType.snowflake:
+        result["execution_readiness"] = snowflake_execution_readiness(cfg, session_active=False)
     # Add helpful diagnostics
     if not result.get("success"):
         err = result.get("error", "").lower()
-        if "authentication" in err or "login" in err or "password" in err or "250001" in err:
+        if _mfa_required_error(err):
+            result["diagnostic"] = _mfa_required_message()
+        elif "authentication" in err or "login" in err or "password" in err or "250001" in err:
             result["diagnostic"] = "Authentication failed. Check username, password, role, and account identifier. For 250001/Snowflake backend errors, verify SYSTEM$ALLOWLIST endpoints and outbound TLS/firewall access."
         elif "network" in err or "timeout" in err or "unreachable" in err:
             result["diagnostic"] = "Network/connectivity issue. Check account identifier format, corporate proxy/TLS trust, and Snowflake allowlist/firewall access."
@@ -345,6 +550,7 @@ async def test_credentials(
 async def test_connection(
     connection_id: str,
     request: Request,
+    body: Optional[ConnectionTestRequest] = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -356,10 +562,34 @@ async def test_connection(
     cipher = get_cipher()
     credentials = cipher.decrypt_dict(conn.credentials) if conn.credentials else {}
     cfg = {**conn.config, **credentials}
+    if body and body.auth_method:
+        cfg["auth_method"] = body.auth_method
+    if body and body.mfa_passcode:
+        cfg["mfa_passcode"] = body.mfa_passcode
+    if conn.type == ConnectionType.snowflake:
+        cfg = normalize_snowflake_config(cfg)
 
-    result = await asyncio.get_event_loop().run_in_executor(
-        _pool, _sync_test, conn.type, cfg
-    )
+    if (
+        conn.type == ConnectionType.snowflake
+        and cfg.get("auth_method") == "password_mfa"
+        and not cfg.get("mfa_passcode")
+    ):
+        result = {
+            "success": False,
+            "error": "Missing MFA/TOTP passcode for Snowflake Password + MFA test.",
+            "diagnostic": _mfa_required_message(),
+        }
+    else:
+        result = await asyncio.get_event_loop().run_in_executor(
+            _pool, _sync_test, conn.type, cfg
+        )
+
+    if not result.get("success"):
+        err = result.get("error", "")
+        if _mfa_required_error(err):
+            result["diagnostic"] = _mfa_required_message()
+    if conn.type == ConnectionType.snowflake:
+        result["execution_readiness"] = snowflake_execution_readiness(cfg, session_active=False)
 
     conn.health = "healthy" if result.get("success") else "failed"
     conn.last_tested = datetime.utcnow()

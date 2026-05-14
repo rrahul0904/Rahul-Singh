@@ -8,10 +8,37 @@ from datetime import datetime
 import logging
 
 from core.database import get_db
-from models import Job, JobTask, JobLog, JobStatus, LoadStrategy, DestinationMode, Connection, MigrationRun, MigrationTaskRun, MigrationState
+from core.security import get_cipher
+from core.auth import get_current_user, require_editor, require_operator
+from models import (
+    Connection,
+    DestinationMode,
+    Job,
+    JobLog,
+    JobStatus,
+    JobTask,
+    LoadStrategy,
+    MigrationChunkManifest,
+    MigrationCostActual,
+    MigrationCostEstimate,
+    MigrationRun,
+    MigrationRunEvent,
+    MigrationSchemaDriftResult,
+    MigrationSnowflakeQuery,
+    MigrationState,
+    MigrationTaskRun,
+    MigrationValidationResult,
+    User,
+)
+from services.snowflake_session_manager import SNOWFLAKE_MFA_EXPIRED_MESSAGE, snowflake_session_manager
+from services.snowflake_connection import normalize_snowflake_config, snowflake_execution_readiness
 
 router = APIRouter()
 logger = logging.getLogger("uma.routes.jobs")
+
+
+def _snowflake_job_guard(cfg: Dict[str, Any], *, session_active: bool) -> dict[str, Any]:
+    return snowflake_execution_readiness(normalize_snowflake_config(cfg), session_active=session_active)
 
 
 class TaskCreate(BaseModel):
@@ -104,7 +131,10 @@ def _task_dict(t: JobTask) -> dict:
 # ── IMPORTANT: static routes MUST come before /{job_id} ──────
 
 @router.get("/stats/summary")
-async def get_stats(db: AsyncSession = Depends(get_db)):
+async def get_stats(
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Aggregate job stats for the dashboard."""
     result = await db.execute(select(func.count(Job.id), func.sum(Job.total_bytes)))
     row = result.one()
@@ -128,6 +158,7 @@ async def list_jobs(
     status: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
+    _user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     q = (
@@ -149,7 +180,11 @@ async def list_jobs(
 
 
 @router.post("", status_code=201)
-async def create_job(body: JobCreate, db: AsyncSession = Depends(get_db)):
+async def create_job(
+    body: JobCreate,
+    _user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
     src = await db.get(Connection, body.source_connection_id)
     dst = await db.get(Connection, body.dest_connection_id)
     if not src: raise HTTPException(400, "Source connection not found")
@@ -162,10 +197,25 @@ async def create_job(body: JobCreate, db: AsyncSession = Depends(get_db)):
         raise HTTPException(400, str(e))
 
     dst_cfg = dst.config or {}
-    sf_warehouse = (body.sf_warehouse or dst_cfg.get("warehouse") or "").strip()
-    sf_database = (body.sf_database or dst_cfg.get("database") or "").strip()
-    sf_schema = (body.sf_schema or dst_cfg.get("schema") or "").strip()
-    sf_role = (body.sf_role or dst_cfg.get("role") or "").strip()
+    decrypted = get_cipher().decrypt_dict(dst.credentials) if dst.credentials else {}
+    dst_cfg_full = normalize_snowflake_config({**dst_cfg, **decrypted})
+    sf_warehouse = (body.sf_warehouse or dst_cfg_full.get("warehouse") or "").strip()
+    sf_database = (body.sf_database or dst_cfg_full.get("database") or "").strip()
+    sf_schema = (body.sf_schema or dst_cfg_full.get("schema") or "").strip()
+    sf_role = (body.sf_role or dst_cfg_full.get("role") or "").strip()
+    if dst.type == ConnectionType.snowflake:
+        readiness = _snowflake_job_guard(
+            {
+                **dst_cfg_full,
+                "warehouse": sf_warehouse,
+                "database": sf_database,
+                "schema": sf_schema,
+                "role": sf_role,
+            },
+            session_active=False,
+        )
+        if readiness["missing_fields"]:
+            raise HTTPException(400, readiness["message"])
 
     job = Job(
         name=body.name,
@@ -206,7 +256,11 @@ async def create_job(body: JobCreate, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/{job_id}")
-async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
+async def get_job(
+    job_id: str,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(
         select(Job)
         .options(selectinload(Job.tasks), selectinload(Job.source_connection), selectinload(Job.dest_connection))
@@ -222,20 +276,57 @@ async def execute_job(
     job_id: str,
     background_tasks: BackgroundTasks,
     engine: str = "auto",
+    _user: User = Depends(require_operator),
     db: AsyncSession = Depends(get_db),
 ):
     job = await db.get(Job, job_id)
     if not job: raise HTTPException(404, "Job not found")
-    if job.status == JobStatus.running:
-        raise HTTPException(409, "Job is already running")
+    dest_conn = await db.get(Connection, job.dest_connection_id)
+    if dest_conn and dest_conn.type.value == "snowflake":
+        cfg = {
+            **(dest_conn.config or {}),
+            **(get_cipher().decrypt_dict(dest_conn.credentials) if dest_conn.credentials else {}),
+        }
+        session_active = bool(
+            snowflake_session_manager.get_active_session(user_id=str(_user.id), connection_id=dest_conn.id)
+        )
+        readiness = _snowflake_job_guard(cfg, session_active=session_active)
+        if readiness["missing_fields"]:
+            job.status = JobStatus.failed
+            job.phase = "REQUIRES_CONFIGURATION"
+            db.add(JobLog(
+                job_id=job.id,
+                level="ERROR",
+                event="SNOWFLAKE_CONFIGURATION_REQUIRED",
+                message=readiness["message"],
+                detail=f"missing_fields={','.join(readiness['missing_fields'])}",
+            ))
+            await db.commit()
+            raise HTTPException(409, readiness["message"])
+        if readiness["requires_mfa_session"] and not readiness["session_active"]:
+            job.status = JobStatus.failed
+            job.phase = "SNOWFLAKE_SESSION_REQUIRED"
+            db.add(JobLog(
+                job_id=job.id,
+                level="ERROR",
+                event="SNOWFLAKE_SESSION_EXPIRED",
+                message=SNOWFLAKE_MFA_EXPIRED_MESSAGE,
+                detail="retryable=true; recommended_action=Unlock Snowflake and retry.",
+            ))
+            await db.commit()
+            raise HTTPException(409, SNOWFLAKE_MFA_EXPIRED_MESSAGE)
 
     if engine not in {"auto", "real", "legacy"}:
         raise HTTPException(400, "engine must be one of: auto, real, legacy")
 
+    from services.job_run_locks import acquire_job_run_lease, new_holder_id
     from services.migration_orchestrator import execute_job as execute_migration_job, select_engine
 
     selection = await select_engine(job_id, engine)
-    background_tasks.add_task(execute_migration_job, job_id, engine)
+    lease = await acquire_job_run_lease(job_id, new_holder_id("api"))
+    if not lease:
+        raise HTTPException(409, "Job is already running")
+    background_tasks.add_task(execute_migration_job, job_id, engine, lease.holder_id, str(_user.id))
     return {
         "message": "Migration execution started",
         "job_id": job_id,
@@ -245,7 +336,11 @@ async def execute_job(
 
 
 @router.post("/{job_id}/cancel")
-async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
+async def cancel_job(
+    job_id: str,
+    _user: User = Depends(require_operator),
+    db: AsyncSession = Depends(get_db),
+):
     """Mark a running job as CANCELLED. The engine polls this status between
     tables and stops at the next checkpoint. Already-running table operations
     are NOT interrupted mid-stream — this is a soft cancel."""
@@ -266,21 +361,72 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/{job_id}/execute-real")
-async def execute_job_real_now(job_id: str, db: AsyncSession = Depends(get_db)):
+async def execute_job_real_now(
+    job_id: str,
+    _user: User = Depends(require_operator),
+    db: AsyncSession = Depends(get_db),
+):
     """Run the selected engine synchronously; useful for local smoke testing and debugging."""
     job = await db.get(Job, job_id)
     if not job: raise HTTPException(404, "Job not found")
-    if job.status == JobStatus.running:
-        raise HTTPException(409, "Job is already running")
+    dest_conn = await db.get(Connection, job.dest_connection_id)
+    if dest_conn and dest_conn.type.value == "snowflake":
+        cfg = {
+            **(dest_conn.config or {}),
+            **(get_cipher().decrypt_dict(dest_conn.credentials) if dest_conn.credentials else {}),
+        }
+        session_active = bool(
+            snowflake_session_manager.get_active_session(user_id=str(_user.id), connection_id=dest_conn.id)
+        )
+        readiness = _snowflake_job_guard(cfg, session_active=session_active)
+        if readiness["missing_fields"]:
+            job.status = JobStatus.failed
+            job.phase = "REQUIRES_CONFIGURATION"
+            db.add(JobLog(
+                job_id=job.id,
+                level="ERROR",
+                event="SNOWFLAKE_CONFIGURATION_REQUIRED",
+                message=readiness["message"],
+                detail=f"missing_fields={','.join(readiness['missing_fields'])}",
+            ))
+            await db.commit()
+            raise HTTPException(409, readiness["message"])
+        if readiness["requires_mfa_session"] and not readiness["session_active"]:
+            job.status = JobStatus.failed
+            job.phase = "SNOWFLAKE_SESSION_REQUIRED"
+            db.add(JobLog(
+                job_id=job.id,
+                level="ERROR",
+                event="SNOWFLAKE_SESSION_EXPIRED",
+                message=SNOWFLAKE_MFA_EXPIRED_MESSAGE,
+                detail="retryable=true; recommended_action=Unlock Snowflake and retry.",
+            ))
+            await db.commit()
+            raise HTTPException(409, SNOWFLAKE_MFA_EXPIRED_MESSAGE)
+    from services.job_run_locks import acquire_job_run_lease, new_holder_id, release_job_run_lease
     from services.migration_orchestrator import execute_job as execute_migration_job
-    result = await execute_migration_job(job_id, "real")
+
+    lease = await acquire_job_run_lease(job_id, new_holder_id("api"))
+    if not lease:
+        raise HTTPException(409, "Job is already running")
+    try:
+        result = await execute_migration_job(job_id, "real", lease.holder_id, str(_user.id))
+    finally:
+        await release_job_run_lease(job_id, lease.holder_id)
+    if result.get("conflict"):
+        raise HTTPException(409, "Job is already running")
     if not result.get("success"):
         raise HTTPException(500, result)
     return result
 
 
 @router.get("/{job_id}/runs")
-async def get_job_runs(job_id: str, limit: int = 50, db: AsyncSession = Depends(get_db)):
+async def get_job_runs(
+    job_id: str,
+    limit: int = 50,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Run history for a job, newest first. Includes per-run task-run aggregates."""
     if not await db.get(Job, job_id):
         raise HTTPException(404, "Job not found")
@@ -339,7 +485,12 @@ async def get_job_runs(job_id: str, limit: int = 50, db: AsyncSession = Depends(
 
 
 @router.get("/{job_id}/runs/{run_id}")
-async def get_run_detail(job_id: str, run_id: str, db: AsyncSession = Depends(get_db)):
+async def get_run_detail(
+    job_id: str,
+    run_id: str,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Single run plus its per-table task-runs."""
     run = (
         await db.execute(
@@ -355,6 +506,34 @@ async def get_run_detail(job_id: str, run_id: str, db: AsyncSession = Depends(ge
             select(MigrationTaskRun)
             .where(MigrationTaskRun.run_id == run_id)
             .order_by(MigrationTaskRun.started_at.asc().nullslast())
+        )
+    ).scalars().all()
+    chunks = (
+        await db.execute(
+            select(MigrationChunkManifest)
+            .where(MigrationChunkManifest.run_id == run_id)
+            .order_by(MigrationChunkManifest.task_id.asc(), MigrationChunkManifest.chunk_index.asc())
+        )
+    ).scalars().all()
+    validations = (
+        await db.execute(
+            select(MigrationValidationResult)
+            .where(MigrationValidationResult.run_id == run_id)
+            .order_by(MigrationValidationResult.created_at.asc())
+        )
+    ).scalars().all()
+    events = (
+        await db.execute(
+            select(MigrationRunEvent)
+            .where(MigrationRunEvent.run_id == run_id)
+            .order_by(MigrationRunEvent.created_at.asc())
+        )
+    ).scalars().all()
+    drift = (
+        await db.execute(
+            select(MigrationSchemaDriftResult)
+            .where(MigrationSchemaDriftResult.run_id == run_id)
+            .order_by(MigrationSchemaDriftResult.created_at.asc())
         )
     ).scalars().all()
 
@@ -400,11 +579,160 @@ async def get_run_detail(job_id: str, run_id: str, db: AsyncSession = Depends(ge
             ),
             "error_message": tr.error_message,
         } for tr in task_runs],
+        "chunk_manifest": [{
+            "id": c.id,
+            "task_id": c.task_id,
+            "table_key": c.table_key,
+            "chunk_index": c.chunk_index,
+            "state": c.state,
+            "stage_table": c.stage_table,
+            "row_count": c.row_count,
+            "bytes_staged": c.bytes_staged,
+            "watermark_start": c.watermark_start,
+            "watermark_end": c.watermark_end,
+            "primary_key_end": c.primary_key_end,
+            "error_message": c.error_message,
+        } for c in chunks],
+        "validation_results": [{
+            "id": v.id,
+            "task_id": v.task_id,
+            "table_key": v.table_key,
+            "rule_type": v.rule_type,
+            "severity": v.severity,
+            "status": v.status,
+            "source_value": v.source_value,
+            "target_value": v.target_value,
+            "delta": v.delta,
+            "message": v.message,
+            "result_json": v.result_json or {},
+            "created_at": v.created_at.isoformat() if v.created_at else None,
+        } for v in validations],
+        "events": [{
+            "id": e.id,
+            "task_id": e.task_id,
+            "table_key": e.table_key,
+            "phase": e.phase,
+            "event": e.event,
+            "level": e.level,
+            "message": e.message,
+            "rows_extracted": e.rows_extracted,
+            "rows_loaded": e.rows_loaded,
+            "rows_merged": e.rows_merged,
+            "rows_deleted": e.rows_deleted,
+            "chunk_count": e.chunk_count,
+            "error_category": e.error_category,
+            "event_json": e.event_json or {},
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+        } for e in events],
+        "schema_drift": [{
+            "id": d.id,
+            "task_id": d.task_id,
+            "table_key": d.table_key,
+            "drift_type": d.drift_type,
+            "column_name": d.column_name,
+            "source_type": d.source_type,
+            "target_type": d.target_type,
+            "source_nullable": d.source_nullable,
+            "target_nullable": d.target_nullable,
+            "severity": d.severity,
+            "action_taken": d.action_taken,
+            "result_json": d.result_json or {},
+            "created_at": d.created_at.isoformat() if d.created_at else None,
+        } for d in drift],
+    }
+
+
+@router.get("/{job_id}/runs/{run_id}/cost")
+async def get_run_cost(
+    job_id: str,
+    run_id: str,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    run = (
+        await db.execute(
+            select(MigrationRun).where(
+                MigrationRun.id == run_id, MigrationRun.job_id == job_id
+            )
+        )
+    ).scalar_one_or_none()
+    if not run:
+        raise HTTPException(404, "Run not found")
+    estimates = (
+        await db.execute(
+            select(MigrationCostEstimate)
+            .where(MigrationCostEstimate.job_id == job_id, MigrationCostEstimate.run_id == run_id)
+            .order_by(MigrationCostEstimate.created_at.asc())
+        )
+    ).scalars().all()
+    actual = (
+        await db.execute(
+            select(MigrationCostActual).where(
+                MigrationCostActual.job_id == job_id,
+                MigrationCostActual.run_id == run_id,
+            )
+        )
+    ).scalar_one_or_none()
+    queries = (
+        await db.execute(
+            select(MigrationSnowflakeQuery)
+            .where(MigrationSnowflakeQuery.job_id == job_id, MigrationSnowflakeQuery.run_id == run_id)
+            .order_by(MigrationSnowflakeQuery.created_at.asc())
+        )
+    ).scalars().all()
+    return {
+        "job_id": job_id,
+        "run_id": run_id,
+        "estimates": [{
+            "id": e.id,
+            "table_name": e.table_name,
+            "estimated_rows": e.estimated_rows,
+            "estimated_source_bytes": e.estimated_source_bytes,
+            "estimated_compressed_bytes": e.estimated_compressed_bytes,
+            "estimated_runtime_seconds": e.estimated_runtime_seconds,
+            "estimated_credits": e.estimated_credits,
+            "estimated_cost": e.estimated_cost,
+            "currency": e.currency,
+            "confidence_level": e.confidence_level,
+            "assumptions": e.assumptions or {},
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+        } for e in estimates],
+        "actual": None if not actual else {
+            "id": actual.id,
+            "warehouse_credits": actual.warehouse_credits,
+            "query_attributed_credits": actual.query_attributed_credits,
+            "cloud_services_credits": actual.cloud_services_credits,
+            "cortex_credits": actual.cortex_credits,
+            "snowpark_credits": actual.snowpark_credits,
+            "storage_cost": actual.storage_cost,
+            "total_estimated_cost": actual.total_estimated_cost,
+            "total_actual_cost": actual.total_actual_cost,
+            "cost_variance_percent": actual.cost_variance_percent,
+            "status": actual.status,
+            "reconciled_at": actual.reconciled_at.isoformat() if actual.reconciled_at else None,
+        },
+        "queries": [{
+            "id": q.id,
+            "task_id": q.task_id,
+            "table_name": q.table_name,
+            "phase": q.phase,
+            "query_id": q.query_id,
+            "query_tag": q.query_tag,
+            "warehouse_name": q.warehouse_name,
+            "status": q.status,
+            "credits_attributed": q.credits_attributed,
+            "actual_cost": q.actual_cost,
+            "created_at": q.created_at.isoformat() if q.created_at else None,
+        } for q in queries],
     }
 
 
 @router.get("/{job_id}/state")
-async def get_job_state(job_id: str, db: AsyncSession = Depends(get_db)):
+async def get_job_state(
+    job_id: str,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     if not await db.get(Job, job_id):
         raise HTTPException(404, "Job not found")
     states = (await db.execute(select(MigrationState).where(MigrationState.job_id == job_id))).scalars().all()
@@ -417,6 +745,7 @@ async def get_job_state(job_id: str, db: AsyncSession = Depends(get_db)):
         "primary_key_columns": s.primary_key_columns,
         "watermark_column": s.watermark_column,
         "last_watermark_value": s.last_watermark_value,
+        "last_primary_key_value": (s.state_json or {}).get("last_primary_key_value"),
         "last_successful_run_id": s.last_successful_run_id,
         "last_success_at": s.last_success_at.isoformat() if s.last_success_at else None,
         "metadata": s.state_json or {},
@@ -427,6 +756,7 @@ async def get_job_state(job_id: str, db: AsyncSession = Depends(get_db)):
 async def update_schedule(
     job_id: str,
     body: JobScheduleUpdate,
+    _user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db),
 ):
     """Set or clear the cron schedule for a job."""
@@ -439,13 +769,22 @@ async def update_schedule(
 
 
 @router.get("/{job_id}/tasks")
-async def list_tasks(job_id: str, db: AsyncSession = Depends(get_db)):
+async def list_tasks(
+    job_id: str,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(select(JobTask).where(JobTask.job_id == job_id))
     return [_task_dict(t) for t in result.scalars().all()]
 
 
 @router.post("/{job_id}/tasks")
-async def add_task(job_id: str, body: TaskCreate, db: AsyncSession = Depends(get_db)):
+async def add_task(
+    job_id: str,
+    body: TaskCreate,
+    _user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
     job = await db.get(Job, job_id)
     if not job: raise HTTPException(404, "Job not found")
     task = JobTask(job_id=job_id, **body.dict())
@@ -456,7 +795,12 @@ async def add_task(job_id: str, body: TaskCreate, db: AsyncSession = Depends(get
 
 
 @router.delete("/{job_id}/tasks/{task_id}", status_code=204)
-async def delete_task(job_id: str, task_id: str, db: AsyncSession = Depends(get_db)):
+async def delete_task(
+    job_id: str,
+    task_id: str,
+    _user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
     task = await db.get(JobTask, task_id)
     if not task or task.job_id != job_id:
         raise HTTPException(404, "Task not found")
@@ -470,6 +814,7 @@ async def get_logs(
     level: Optional[str] = None,
     task_ref: Optional[str] = None,
     limit: int = 200,
+    _user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     q = (
@@ -489,7 +834,11 @@ async def get_logs(
 
 
 @router.delete("/{job_id}", status_code=204)
-async def delete_job(job_id: str, db: AsyncSession = Depends(get_db)):
+async def delete_job(
+    job_id: str,
+    _user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
     job = await db.get(Job, job_id)
     if not job: raise HTTPException(404, "Job not found")
     if job.status == JobStatus.running:

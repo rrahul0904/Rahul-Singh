@@ -77,7 +77,7 @@ class NetSuiteConnector:
         try:
             url = f"{self._base_url}/query/v1/suiteql"
             resp = self._session.post(
-                url, json={"q": "SELECT id, companyname FROM customer LIMIT 1"},
+                url, json={"q": "SELECT 1"},
                 headers={"Authorization": self._oauth_header("POST", url)},
                 timeout=15)
             return {"success": resp.ok, "status": resp.status_code}
@@ -85,8 +85,7 @@ class NetSuiteConnector:
             return {"success": False, "error": str(e)}
 
     def list_objects(self) -> List[str]:
-        return ["customer","employee","vendor","invoice","salesorder","purchaseorder",
-                "item","account","journalentry","transaction","customrecord"]
+        return []
 
     def fetch_records(self, object_name: str, limit: int = 1000) -> List[Dict]:
         url = f"{self._base_url}/query/v1/suiteql"

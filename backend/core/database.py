@@ -74,6 +74,16 @@ async def init_db():
                 END $$;
             """))
             await conn.execute(text("ALTER TABLE connections ADD COLUMN IF NOT EXISTS connection_role connectionrole NOT NULL DEFAULT 'both'"))
+            await conn.execute(text("ALTER TABLE sync_profiles ADD COLUMN IF NOT EXISTS job_id VARCHAR NULL"))
+            await conn.execute(text("ALTER TABLE sync_profiles ADD COLUMN IF NOT EXISTS source_dataset VARCHAR(255) NULL"))
+            await conn.execute(text("ALTER TABLE sync_profiles ADD COLUMN IF NOT EXISTS source_table VARCHAR(255) NULL"))
+            await conn.execute(text("ALTER TABLE sync_profiles ADD COLUMN IF NOT EXISTS target_schema VARCHAR(255) NULL"))
+            await conn.execute(text("ALTER TABLE sync_profiles ADD COLUMN IF NOT EXISTS target_table VARCHAR(255) NULL"))
+            await conn.execute(text("ALTER TABLE sync_profiles ADD COLUMN IF NOT EXISTS task_config JSONB NOT NULL DEFAULT '{}'::jsonb"))
+            await conn.execute(text("ALTER TABLE code_generation_artifacts ADD COLUMN IF NOT EXISTS basis_for_generation VARCHAR(80) DEFAULT 'user_prompt_only'"))
+            await conn.execute(text("ALTER TABLE code_generation_artifacts ADD COLUMN IF NOT EXISTS parent_artifact_id VARCHAR NULL"))
+            await conn.execute(text("ALTER TABLE code_generation_artifacts ADD COLUMN IF NOT EXISTS revision_number INTEGER DEFAULT 1"))
+            await conn.execute(text("ALTER TABLE human_review_items ADD COLUMN IF NOT EXISTS metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb"))
     logger.info("Database tables ready (create_all + compatibility migrations)")
 
 

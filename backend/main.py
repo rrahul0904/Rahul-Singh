@@ -16,9 +16,17 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from api.routes import (
-    connections, jobs, tables, validation, ai, health, snowflake,
-    auth, projects, drift, syncs, demo,
+    catalog, connections, jobs, tables, validation, ai, health, snowflake,
+    auth, projects, drift, syncs,
+    agent_runs,
+    copilot,
+    rag,
+    internal_tools,
+    intelligence,
+    replication,
+    control_plane,
     settings as settings_routes,
+    workspace,
 )
 from core.config import settings
 from core.database import init_db
@@ -256,13 +264,21 @@ app.include_router(projects.router,    prefix="/api",              tags=["Projec
 app.include_router(connections.router, prefix="/api/connections",  tags=["Connections"])
 app.include_router(jobs.router,        prefix="/api/jobs",         tags=["Jobs"])
 app.include_router(tables.router,      prefix="/api/tables",       tags=["Tables"])
+app.include_router(catalog.router,     prefix="/api/catalog",      tags=["Catalog"])
+app.include_router(workspace.router,   prefix="/api/workspace",    tags=["SQL Workspace"])
 app.include_router(validation.router,  prefix="/api/validation",   tags=["Validation"])
 app.include_router(drift.router,       prefix="/api/drift",        tags=["Schema Drift"])
+app.include_router(agent_runs.router,  prefix="/api/agent-runs",   tags=["Agentic Orchestration"])
+app.include_router(copilot.router,     prefix="/api/copilot",      tags=["Copilot"])
+app.include_router(rag.router,         prefix="/api/rag",          tags=["RAG"])
+app.include_router(internal_tools.router, prefix="/api/internal-tools", tags=["Internal Tool Registry"])
 app.include_router(ai.router,          prefix="/api/ai",           tags=["AI"])
 app.include_router(snowflake.router,   prefix="/api/snowflake",    tags=["Snowflake"])
 app.include_router(settings_routes.router, prefix="/api/settings",     tags=["Settings"])
 app.include_router(syncs.router,       prefix="/api/syncs",        tags=["Managed Syncs"])
-app.include_router(demo.router,        prefix="/api/demo",         tags=["Demo"])
+app.include_router(replication.router, prefix="/api/replication",  tags=["Data Replication"])
+app.include_router(intelligence.router, prefix="/api/intelligence", tags=["Migration Intelligence"])
+app.include_router(control_plane.router, prefix="/api", tags=["Migration Control Plane"])
 
 
 @app.get("/")
