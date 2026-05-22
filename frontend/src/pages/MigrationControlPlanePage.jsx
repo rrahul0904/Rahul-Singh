@@ -303,17 +303,18 @@ function DataTable({ columns, rows, onRowClick, emptyTitle, emptyMessage, emptyA
   );
 }
 
-function OperationsAlertStrip({ items = [], fallback = "No open blockers. Continue with the next planned migration action.", activeId = "" }) {
+function OperationsAlertStrip({ items = [], activeId = "" }) {
   const visible = items.filter(Boolean).slice(0, 3);
+  if (!visible.length) return null;
   const activeItem = visible.find((item) => String(item.id || "") === String(activeId || "")) || visible[0];
   return (
-    <div className={`ep-alert-strip ${visible.length ? "has-blockers" : ""}`}>
+    <div className="ep-alert-strip has-blockers">
       <div>
-        <div className="ep-alert-kicker">{visible.length ? `${visible.length} priority blocker${visible.length === 1 ? "" : "s"}` : "No critical blockers"}</div>
-        <div className="ep-alert-title">{activeItem?.title || fallback}</div>
+        <div className="ep-alert-kicker">{`${visible.length} priority blocker${visible.length === 1 ? "" : "s"}`}</div>
+        <div className="ep-alert-title">{activeItem?.title || "Open blocker"}</div>
       </div>
       <div className="ep-alert-items">
-        {visible.length ? visible.map((item, index) => (
+        {visible.map((item, index) => (
           <button key={item.id || index} type="button" className={`ep-alert-item ${String(item.id || "") === String(activeId || "") ? "active" : ""}`} onClick={item.onClick}>
             <StatusBadge status={item.status || "REQUIRES_REVIEW"} />
             <span className="ep-alert-copy">
@@ -321,7 +322,7 @@ function OperationsAlertStrip({ items = [], fallback = "No open blockers. Contin
               <span>{item.action || "Open evidence"}</span>
             </span>
           </button>
-        )) : <span className="ep-alert-ok">Workspace is clear</span>}
+        ))}
       </div>
     </div>
   );
@@ -1638,22 +1639,23 @@ export function CommandCenterPage({ setPage = null }) {
     <PageTransition className="page pq-page">
       <PageHeader
         title="Command Center"
-        subtitle="Live operations cockpit for failed runs, review gates, validation blockers, artifacts, and the next operator action."
         primaryAction={<button className="btn btn-primary" onClick={refresh}>Refresh runs</button>}
       />
-      <OperationsAlertStrip
-        items={blockerRows.map((row) => ({
-          id: row.id,
-          title: objectDisplayName(row),
-          status: row.status,
-          action: row.next_action || (row.status === "FAILED" ? "Inspect failure" : "Open review"),
-          onClick: () => {
-            setSelectedRun(row);
-            setActiveKpi(row.status === "FAILED" ? "failed" : "review");
-          },
-        }))}
-        activeId={selectedRun?.id}
-      />
+      {blockerRows.length > 0 ? (
+        <OperationsAlertStrip
+          items={blockerRows.map((row) => ({
+            id: row.id,
+            title: objectDisplayName(row),
+            status: row.status,
+            action: row.next_action || (row.status === "FAILED" ? "Inspect failure" : "Open review"),
+            onClick: () => {
+              setSelectedRun(row);
+              setActiveKpi(row.status === "FAILED" ? "failed" : "review");
+            },
+          }))}
+          activeId={selectedRun?.id}
+        />
+      ) : null}
       <EnterpriseKpiRow items={[
         { label: "Runs", value: summary.total, note: "persisted objects", active: activeKpi === "runs", onClick: () => setActiveKpi("runs") },
         { label: "Running", value: summary.active, note: "currently active", active: activeKpi === "running", onClick: () => setActiveKpi("running") },
@@ -1669,7 +1671,6 @@ export function CommandCenterPage({ setPage = null }) {
             <div className="ep-list-head">
               <div>
                 <div className="ep-list-title">Active runs, failures, and review gates</div>
-              <div className="ep-list-subtitle">Filtered by the selected KPI. Select a run to inspect current phase, artifacts, logs, report evidence, and next action.</div>
               </div>
               <StatusBadge status={summary.failed ? "FAILED" : summary.review ? "REQUIRES_REVIEW" : "HEALTHY"} />
             </div>

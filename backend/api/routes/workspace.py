@@ -76,6 +76,7 @@ def _queryable_connection_dict(conn: Connection, user: User) -> dict[str, Any]:
     if active:
         badges.append("SESSION ACTIVE")
     cfg = conn.config or {}
+    auth_method = cfg.get("auth_method") or "password"
     return {
         "id": conn.id,
         "name": conn.name,
@@ -83,6 +84,7 @@ def _queryable_connection_dict(conn: Connection, user: User) -> dict[str, Any]:
         "role": role,
         "badges": badges,
         "read_only": conn.type != ConnectionType.snowflake or role == "source",
+        "auth_method": auth_method,
         "mfa_required": _mfa_required(conn),
         "session_active": active,
         "session": snowflake_session_manager.public(active_entry) if active_entry else None,
