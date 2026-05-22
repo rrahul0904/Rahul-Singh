@@ -4117,7 +4117,7 @@ function Dashboard({ setPage }) {
   const { data: conns, loading: connsLoading } = useApi(() => api.getConnections(), []);
   const { data: stats, loading: statsLoading } = useApi(() => api.getJobStats(), []);
   const { data: health } = useApi(() => api.getHealth(), []);
-  const [activeKpi, setActiveKpi] = useState("project");
+  const [activeKpi, setActiveKpi] = useState("runs");
   const [selectedBlocker, setSelectedBlocker] = useState(null);
 
   const connectionRows = Array.isArray(conns) ? conns : [];
@@ -4138,7 +4138,6 @@ function Dashboard({ setPage }) {
   const totalJobs = Number(stats?.total_jobs || recentJobs.length || 0);
   const loading = jobsLoading || connsLoading || statsLoading;
   const overviewKpis = [
-    { id: "project", label: "Project health", value: failedJobs.length || unhealthyConnections.length ? "Blocked" : "Ready", note: `${failedJobs.length} failed runs` },
     { id: "connections", label: "Connections", value: `${healthyConnections.length}/${connectionRows.length || 0}`, note: "healthy endpoints" },
     { id: "running", label: "Running", value: runningJobs.length, note: "active jobs" },
     { id: "review", label: "Review", value: reviewJobs.length, note: "needs decision" },
@@ -4146,7 +4145,6 @@ function Dashboard({ setPage }) {
     { id: "runs", label: "Runs", value: totalJobs, note: "job definitions" },
   ];
   const overviewRows = {
-    project: [...failedJobs, ...unhealthyConnections.map((connection) => ({ ...connection, name: connection.name, status: connection.health || connection.status || "FAILED", source_connection_type: connection.type, total_bytes_gb: 0, object_kind: "Connection" }))],
     connections: connectionRows.map((connection) => ({ ...connection, object_kind: "Connection", status: connection.health || connection.status || "UNKNOWN", total_bytes_gb: 0 })),
     running: runningJobs,
     review: reviewJobs,
@@ -4161,7 +4159,6 @@ function Dashboard({ setPage }) {
         <div className="page-header-copy">
           <div className="page-eyebrow">Migration Control Plane</div>
           <div className="page-title">Command Center</div>
-          <div className="page-subtitle">A live landing cockpit for blockers, failed runs, connection health, recent activity, and the next operator action.</div>
         </div>
         <div className="page-actions">
           <button className="btn btn-primary" onClick={() => setPage("dashboard")}>Open Run Board</button>
@@ -4169,22 +4166,22 @@ function Dashboard({ setPage }) {
         </div>
       </div>
 
-      <div className={`ep-alert-strip ${blockers.length ? "has-blockers" : ""}`}>
+      {blockers.length ? <div className="ep-alert-strip has-blockers">
         <div>
-          <div className="ep-alert-kicker">{blockers.length ? `${blockers.length} blockers need attention` : "No active blockers"}</div>
+          <div className="ep-alert-kicker">{`${blockers.length} blockers need attention`}</div>
           <div className="ep-alert-title">
-            {activeBlocker?.title || "Current workspace is clear for the next planned action."}
+            {activeBlocker?.title}
           </div>
         </div>
         <div className="ep-alert-items">
-          {blockers.length ? blockers.slice(0, 3).map((blocker) => (
+          {blockers.slice(0, 3).map((blocker) => (
             <button
               key={blocker.id}
               className={`ep-alert-item ${activeBlocker?.id === blocker.id ? "active" : ""}`}
               type="button"
               onClick={() => {
                 setSelectedBlocker(blocker);
-                setActiveKpi(blocker.object_kind === "Connection" ? "connections" : blocker.status === "REQUIRES_REVIEW" ? "review" : "project");
+                setActiveKpi(blocker.object_kind === "Connection" ? "connections" : blocker.status === "REQUIRES_REVIEW" ? "review" : "failed");
               }}
             >
               <StatusBadge status={blocker.status} />
@@ -4193,9 +4190,9 @@ function Dashboard({ setPage }) {
                 <span>{blocker.action}</span>
               </span>
             </button>
-          )) : <span className="ep-alert-ok">Ready for review or validation planning</span>}
+          ))}
         </div>
-      </div>
+      </div> : null}
 
       {activeBlocker ? (
         <div className="ep-list-panel" style={{ marginBottom: 12 }}>
@@ -4235,13 +4232,12 @@ function Dashboard({ setPage }) {
         <div className="ep-list-head">
           <div>
             <div className="ep-list-title">{overviewTitle} details</div>
-            <div className="ep-list-subtitle">Opened from the Command Center KPI strip. Rows route to their owning page for deeper action.</div>
           </div>
-          <StatusBadge status={activeKpi === "project" && overviewRows.length ? "REQUIRES_REVIEW" : "OPEN"} />
+          <StatusBadge status="OPEN" />
         </div>
         <div className="table-scroll">
           <table className="dashboard-table">
-            <thead><tr><th>Name</th><th>Object</th><th>Status</th><th>Updated</th><th>Data</th><th>Action</th></tr></thead>
+            <thead><tr><th>Name</th><th>Object</th><th>Status</th><th>Updated</th><th>Data</th></tr></thead>
             <tbody>
               {overviewRows.map((row) => (
                 <tr key={`${row.object_kind || "Job"}-${row.id || row.name}`}>
@@ -4250,7 +4246,6 @@ function Dashboard({ setPage }) {
                   <td><StatusBadge status={row.status || row.health || "UNKNOWN"} /></td>
                   <td className="td-mono">{fmt_dt(row.started_at || row.created_at || row.updated_at || row.last_checked_at)}</td>
                   <td className="td-mono">{Number(row.total_bytes_gb || 0).toFixed(1)} GB</td>
-                  <td><button className="btn btn-ghost btn-sm" type="button" onClick={() => setPage(row.object_kind === "Connection" ? "connections" : "jobs")}>Open</button></td>
                 </tr>
               ))}
             </tbody>
@@ -4278,7 +4273,7 @@ function Dashboard({ setPage }) {
           ) : (
             <div className="table-scroll">
               <table className="dashboard-table">
-                <thead><tr><th>Job</th><th>Source</th><th>Status</th><th>Started</th><th>Data</th><th>Action</th></tr></thead>
+                <thead><tr><th>Job</th><th>Source</th><th>Status</th><th>Started</th><th>Data</th></tr></thead>
                 <tbody>
                   {recentJobs.map((job) => (
                     <tr key={job.id}>
@@ -4287,7 +4282,6 @@ function Dashboard({ setPage }) {
                       <td><StatusBadge status={job.status} /></td>
                       <td className="td-mono">{fmt_dt(job.started_at || job.created_at)}</td>
                       <td className="td-mono">{Number(job.total_bytes_gb || 0).toFixed(1)} GB</td>
-                      <td><button className="btn btn-ghost btn-sm" type="button" onClick={() => setPage("jobs")}>Open</button></td>
                     </tr>
                   ))}
                 </tbody>
@@ -5209,7 +5203,7 @@ function ConnectionsPage() {
   const handleTest = async (conn) => {
     if (conn?.type === "snowflake") {
       setMfaCode("");
-      setMfaAuthMethod(conn?.config?.auth_method || "password_mfa");
+      setMfaAuthMethod(conn?.config?.auth_method || conn?.safe_details?.auth_method || "password");
       setMfaTest(conn);
       return;
     }
@@ -5481,7 +5475,7 @@ function ConnectionsPage() {
             <select className="fi" value={mfaAuthMethod} onChange={e=>{ setMfaAuthMethod(e.target.value); setMfaCode(""); }}>
               <option value="password">Password</option>
               <option value="password_mfa">Password + MFA</option>
-              <option value="key_pair" disabled>Key Pair (coming soon)</option>
+              <option value="key_pair">Key Pair / Private Key</option>
             </select>
           </div>
           {mfaAuthMethod === "password_mfa" && (
@@ -7181,7 +7175,7 @@ function WorkspacePage() {
     setWorkspaceSessionId("");
     setWorkspaceSessionExpiresAt("");
     setSessionMessage("");
-    setUnlockAuthMethod(selectedConnection?.mfa_required ? "password_mfa" : "password");
+    setUnlockAuthMethod(selectedConnection?.auth_method || (selectedConnection?.mfa_required ? "password_mfa" : "password"));
     setUnlockMfaPasscode("");
     setDbs([]); setSchemas([]); setTables([]);
     setDatabase(""); setSchemaName(""); setSelectedTable("");
@@ -7535,7 +7529,7 @@ function WorkspacePage() {
             <select className="fi" value={unlockAuthMethod} onChange={e=>{ setUnlockAuthMethod(e.target.value); setUnlockMfaPasscode(""); setError(""); }}>
               <option value="password">Password</option>
               <option value="password_mfa">Password + verification code</option>
-              <option value="key_pair" disabled>Key Pair (coming soon)</option>
+              <option value="key_pair">Key Pair / Private Key</option>
             </select>
           </Field>
           {unlockAuthMethod === "password_mfa" && (
@@ -9408,23 +9402,6 @@ export default function App() {
               <div className="topbar-avatar" title={authUser.name || authUser.email}>{(authUser.name || authUser.email || 'U').slice(0,1).toUpperCase()}</div>
             </div>
           </header>
-          {authToken && authUser ? (
-            <div style={{ margin: "12px 20px 0", border: "1px solid var(--border)", borderRadius: 8, background: "var(--bg2)", padding: "10px 12px", display: "grid", gridTemplateColumns: "minmax(220px,1.4fr) repeat(5,minmax(110px,1fr)) auto", gap: 10, alignItems: "center" }}>
-              <div style={{ minWidth: 0 }}>
-                <div style={{ fontSize: 10, fontWeight: 800, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", fontFamily: "var(--font-m)" }}>Selected Migration Run</div>
-                <div className="td-main" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{selectedRunContext?.run?.name || selectedRunContextError || "No run selected"}</div>
-              </div>
-              <div><div className="stat-label">Status</div><div>{selectedRunContext ? <StatusBadge status={selectedRunContext.run_status} /> : "None"}</div></div>
-              <div><div className="stat-label">Source</div><div className="td-mono" style={{ fontSize: 11 }}>{selectedRunContext?.source_target?.source_dialect || "n/a"}</div></div>
-              <div><div className="stat-label">Target</div><div className="td-mono" style={{ fontSize: 11 }}>{selectedRunContext?.source_target?.target_dialect || "snowflake"}</div></div>
-              <div><div className="stat-label">Readiness</div><div className="td-main">{selectedRunContext?.readiness_score ?? "n/a"}</div></div>
-              <div><div className="stat-label">Blockers</div><div className="td-main">{selectedRunContext?.blockers?.length ?? 0}</div></div>
-              <button className="btn btn-ghost btn-sm" disabled={!selectedRunContext} onClick={() => setPage("run_detail")}>Run Detail</button>
-              <div style={{ gridColumn: "1 / -1", color: "var(--text3)", fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                Next action: {selectedRunContext?.next_recommended_action || "Select a run from Command Center or a module workspace."}
-              </div>
-            </div>
-          ) : null}
           {commandOpen && (
             <Modal title="Command palette" onClose={() => setCommandOpen(false)} width={680}>
               <input
